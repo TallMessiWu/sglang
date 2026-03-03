@@ -18,6 +18,8 @@ from typing import AsyncIterator, Dict, Optional
 import grpc
 import msgspec
 import numpy as np
+
+import sglang
 import torch
 import zmq
 import zmq.asyncio
@@ -26,10 +28,6 @@ from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
-from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
-from smg_grpc_proto.generated import common_pb2
-
-import sglang
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -39,7 +37,7 @@ from sglang.srt.disaggregation.kv_events import (
     KVEventsConfig,
     ZmqEventPublisher,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, FAKE_BOOTSTRAP_HOST
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
 from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
@@ -55,6 +53,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingPar
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
+from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from smg_grpc_proto.generated import common_pb2
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -167,6 +167,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         model_info: Dict,
         scheduler_info: Dict,
         health_servicer: Optional[SGLangHealthServicer] = None,
+        model_config: Optional[ModelConfig] = None,
     ):
         """Initialize the standalone gRPC service."""
         self.request_manager = request_manager
@@ -205,6 +206,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     )
             except Exception as e:
                 logger.warning("Failed to parse kv_events_config: %s", e)
+
+        # Store HF config for M-RoPE models (Qwen VL family).
+        self._hf_config = None
+        if model_config is not None:
+            hf_text_config = model_config.hf_text_config
+            rope_scaling = getattr(hf_text_config, "rope_parameters", None) or getattr(
+                hf_text_config, "rope_scaling", None
+            )
+            if rope_scaling and "mrope_section" in rope_scaling:
+                self._hf_config = model_config.hf_config
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -762,7 +773,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField(
             "pixel_values"
         ):
-            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, input_ids)
 
         # Create request
         return TokenizedGenerateReqInput(
@@ -797,7 +808,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
         return torch.from_numpy(arr)
 
-    def _parse_mm_inputs(self, mm_proto) -> dict:
+    def _parse_mm_inputs(self, mm_proto, input_ids: list) -> dict:
         """Parse proto MultimodalInputs into the mm_inputs dict expected by scheduler."""
         # Decode pixel_values from typed TensorData field
         pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
@@ -830,6 +841,25 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         if mm_proto.HasField("im_token_id"):
             result["im_token_id"] = mm_proto.im_token_id
+
+        # Compute M-RoPE positions for Qwen VL models.
+        if self._hf_config is not None:
+            from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+
+            hf = self._hf_config
+            image_grid_thw = model_specific_data.get("image_grid_thw")
+            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=hf.vision_config.spatial_merge_size,
+                image_token_id=hf.image_token_id,
+                video_token_id=hf.video_token_id,
+                vision_start_token_id=hf.vision_start_token_id,
+                model_type=hf.model_type,
+                tokens_per_second=getattr(hf.vision_config, "tokens_per_second", None),
+                input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
+                image_grid_thw=image_grid_thw,
+            )
+            result["mrope_positions"] = mrope_positions.squeeze(1)
+            result["mrope_position_delta"] = mrope_position_delta
 
         return result
 
@@ -1197,6 +1227,7 @@ async def serve_grpc(
         model_info=model_info,
         scheduler_info=scheduler_info,
         health_servicer=health_servicer,
+        model_config=model_config,
     )
     sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
 
