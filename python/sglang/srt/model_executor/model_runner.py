@@ -607,7 +607,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 top_k=2048,
-                device_buffer_size=2048,
+                device_buffer_size=4096,
                 device=self.device,
                 tp_group=(
                     self.attention_tp_group.cpu_group

@@ -66,6 +66,9 @@ class HiSparseCoordinator:
         self.req_to_device_buffer = torch.zeros(
             (max_num_reqs, self.padded_buffer_size), dtype=torch.int64, device=device
         )
+        self.req_device_buffer_size = torch.zeros(
+            max_num_reqs, dtype=torch.int64, device="cpu"
+        )
         self.req_to_host_pool = torch.full(
             (max_num_reqs, max_context_len),
             -1,
@@ -163,24 +166,32 @@ class HiSparseCoordinator:
         allocated_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
+        page_size = self.mem_pool_device.page_size
+        # Allocate only enough for current tokens (page-aligned).
+        # When prefill already fills device_buffer_size, include the reserved page.
+        alloc_size = min(
+            ((req.kv_allocated_len + page_size - 1) // page_size) * page_size,
+            self.device_buffer_size,
+        )
+        if alloc_size == self.device_buffer_size:
+            alloc_size = self.padded_buffer_size
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             allocated_indices,
-            self.padded_buffer_size,
+            alloc_size,
         )
         if buffer_indices is None:
             logger.error(
                 "HiSparse: alloc_device_buffer failed for req %s "
-                "(kv_allocated_len=%d, padded_buffer_size=%d)",
+                "(kv_allocated_len=%d, alloc_size=%d)",
                 req.rid,
                 req.kv_allocated_len,
-                self.padded_buffer_size,
+                alloc_size,
             )
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
-        self.req_to_device_buffer[req.req_pool_idx, : self.padded_buffer_size] = (
-            buffer_indices
-        )
 
-        # initialize the token locs for the device buffer
+        self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
+        self.req_device_buffer_size[req.req_pool_idx] = alloc_size
+
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
         ] = torch.arange(self.device_buffer_size, device=self.device)
@@ -228,6 +239,66 @@ class HiSparseCoordinator:
             req.batch = None
         return ready_batch
 
+    def _grow_device_buffers(
+        self,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        """Grow device buffers for requests whose sequence length exceeds current capacity.
+
+        Called before mapping decode tokens so that buffer slots exist for the
+        new positions.  Growth happens in page-sized increments.  When the
+        buffer reaches device_buffer_size, the reserved page is included and
+        req_device_buffer_size is set to padded_buffer_size.
+        """
+        current_caps = self.req_device_buffer_size[req_pool_indices]
+        needs_grow = (seq_lens > current_caps) & (
+            current_caps < self.padded_buffer_size
+        )
+
+        if not torch.any(needs_grow):
+            return
+
+        page_size = self.mem_pool_device.page_size
+        grow_indices = torch.where(needs_grow)[0]
+
+        # todo hisparse: to batch the growing
+        for i in grow_indices:
+            req_idx = int(req_pool_indices[i].item())
+            current_cap = int(current_caps[i].item())
+            seq_len = int(seq_lens[i].item())
+
+            new_cap = min(
+                ((seq_len + page_size - 1) // page_size) * page_size,
+                self.device_buffer_size,
+            )
+            # Include reserved page when reaching device_buffer_size
+            if new_cap == self.device_buffer_size:
+                new_cap = self.padded_buffer_size
+            grow_size = new_cap - current_cap
+            if grow_size <= 0:
+                continue
+
+            new_hisparse_indices = (
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(grow_size)
+            )
+            if new_hisparse_indices is None:
+                logger.error(
+                    "HiSparse: _grow_device_buffers failed for req pool idx %d "
+                    "(current_cap=%d, new_cap=%d, grow_size=%d)",
+                    req_idx,
+                    current_cap,
+                    new_cap,
+                    grow_size,
+                )
+                raise RuntimeError(
+                    f"HiSparse _grow_device_buffers failed (grow_size={grow_size})"
+                )
+
+            self.req_to_device_buffer[req_idx, current_cap:new_cap] = (
+                new_hisparse_indices
+            )
+
     def map_last_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
@@ -235,6 +306,8 @@ class HiSparseCoordinator:
         req_pool_indices: torch.Tensor,
     ) -> None:
         self._eager_backup_previous_token(seq_lens, req_pool_indices)
+        # Grow device buffers for requests that need more space before mapping.
+        self._grow_device_buffers(seq_lens, req_pool_indices)
 
         reserved_buffer_loc = self.req_to_device_buffer[
             req_pool_indices, self.device_buffer_size
@@ -434,8 +507,9 @@ class HiSparseCoordinator:
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
 
-        # release memory
-        buffer_indices = self.req_to_device_buffer[req.req_pool_idx]
+        # release memory — only free actually-allocated buffer indices
+        current_cap = int(self.req_device_buffer_size[req.req_pool_idx].item())
+        buffer_indices = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
         self.token_to_kv_pool_allocator.free_hisparse_indices(buffer_indices)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
@@ -453,6 +527,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
+        self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
 
