@@ -66,8 +66,9 @@ class HiSparseCoordinator:
         self.req_to_device_buffer = torch.zeros(
             (max_num_reqs, self.padded_buffer_size), dtype=torch.int64, device=device
         )
+        # todo: move this to CPU to reduce fine grained query overhead
         self.req_device_buffer_size = torch.zeros(
-            max_num_reqs, dtype=torch.int64, device="cpu"
+            max_num_reqs, dtype=torch.int64, device=self.device
         )
         self.req_to_host_pool = torch.full(
             (max_num_reqs, max_context_len),
@@ -195,9 +196,9 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
         ] = torch.arange(self.device_buffer_size, device=self.device)
-        self.req_device_buffer_token_locs[
-            :, req.req_pool_idx, : self.padded_buffer_size
-        ] = buffer_indices[: self.padded_buffer_size]
+        self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
+            buffer_indices[:alloc_size]
+        )
 
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
@@ -298,6 +299,10 @@ class HiSparseCoordinator:
             self.req_to_device_buffer[req_idx, current_cap:new_cap] = (
                 new_hisparse_indices
             )
+            self.req_device_buffer_token_locs[:, req_idx, current_cap:new_cap] = (
+                new_hisparse_indices
+            )
+            self.req_device_buffer_size[req_idx] = new_cap
 
     def map_last_loc_to_buffer(
         self,
