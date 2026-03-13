@@ -57,6 +57,7 @@ def _amd_dp_attention_args():
         AMD_4GPU_TIMEOUT,
         "--dist-timeout",
         AMD_4GPU_TIMEOUT,
+        "--disable-custom-all-reduce",
     ]
 
 

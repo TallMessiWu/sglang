@@ -64,6 +64,7 @@ def _extend_amd_server_args(other_args):
                 AMD_CI_TIMEOUT,
                 "--dist-timeout",
                 AMD_CI_TIMEOUT,
+                "--disable-custom-all-reduce",
             ]
         )
     return server_args
