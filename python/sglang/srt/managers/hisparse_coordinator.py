@@ -1,11 +1,11 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
@@ -203,10 +203,10 @@ class HiSparseCoordinator:
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
-    def collect_ready_batch(self) -> Optional[ScheduleBatch]:
-        ready_batch = None
+    def collect_ready_reqs(self) -> List[Req]:
+        ready_reqs = []
         if len(self.ack_staging_queue) == 0:
-            return ready_batch
+            return ready_reqs
 
         finish_count = 0
         for _, finish_event, _ in self.ack_staging_queue:
@@ -228,81 +228,72 @@ class HiSparseCoordinator:
             self.alloc_device_buffer(req)
             req.staging = False
             finish_count -= 1
-            if (
-                len(self.ack_staging_queue) == 0
-                or self.ack_staging_queue[0][2].batch != req.batch
-            ):
-                if ready_batch is None:
-                    ready_batch = req.batch
-                else:
-                    ready_batch.merge_batch(req.batch)
-            # to break the circular reference
-            req.batch = None
-        return ready_batch
+            ready_reqs.append(req)
+        return ready_reqs
 
     def _grow_device_buffers(
         self,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
-    ) -> None:
-        """Grow device buffers for requests whose sequence length exceeds current capacity.
-
-        Called before mapping decode tokens so that buffer slots exist for the
-        new positions.  Growth happens in page-sized increments.  When the
-        buffer reaches device_buffer_size, the reserved page is included and
-        req_device_buffer_size is set to padded_buffer_size.
-        """
+    ) -> torch.Tensor:
+        """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices]
-        needs_grow = (seq_lens > current_caps) & (
-            current_caps < self.padded_buffer_size
+        short_reqs = seq_lens <= self.device_buffer_size
+        needs_grow = short_reqs & (seq_lens > current_caps)
+
+        if torch.any(needs_grow):
+            page_size = self.mem_pool_device.page_size
+            grow_indices = torch.where(needs_grow)[0]
+
+            # todo: expensive to have all the fragmented access
+            for i in grow_indices:
+                req_idx = int(req_pool_indices[i].item())
+                current_cap = int(current_caps[i].item())
+                seq_len = int(seq_lens[i].item())
+
+                new_cap = min(
+                    ((seq_len + page_size - 1) // page_size) * page_size,
+                    self.device_buffer_size,
+                )
+                # Include reserved page when reaching device_buffer_size
+                if new_cap == self.device_buffer_size:
+                    new_cap = self.padded_buffer_size
+                grow_size = new_cap - current_cap
+                if grow_size <= 0:
+                    continue
+
+                new_hisparse_indices = (
+                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                        grow_size
+                    )
+                )
+                if new_hisparse_indices is None:
+                    logger.error(
+                        "HiSparse: _grow_device_buffers failed for req pool idx %d "
+                        "(current_cap=%d, new_cap=%d, grow_size=%d)",
+                        req_idx,
+                        current_cap,
+                        new_cap,
+                        grow_size,
+                    )
+                    raise RuntimeError(
+                        f"HiSparse _grow_device_buffers failed (grow_size={grow_size})"
+                    )
+
+                self.req_to_device_buffer[req_idx, current_cap:new_cap] = (
+                    new_hisparse_indices
+                )
+                self.req_device_buffer_token_locs[:, req_idx, current_cap:new_cap] = (
+                    new_hisparse_indices
+                )
+                self.req_device_buffer_size[req_idx] = new_cap
+
+        reserved_positions = torch.where(
+            short_reqs,
+            seq_lens - 1,
+            torch.full_like(seq_lens, self.device_buffer_size),
         )
-
-        if not torch.any(needs_grow):
-            return
-
-        page_size = self.mem_pool_device.page_size
-        grow_indices = torch.where(needs_grow)[0]
-
-        # todo hisparse: to batch the growing
-        for i in grow_indices:
-            req_idx = int(req_pool_indices[i].item())
-            current_cap = int(current_caps[i].item())
-            seq_len = int(seq_lens[i].item())
-
-            new_cap = min(
-                ((seq_len + page_size - 1) // page_size) * page_size,
-                self.device_buffer_size,
-            )
-            # Include reserved page when reaching device_buffer_size
-            if new_cap == self.device_buffer_size:
-                new_cap = self.padded_buffer_size
-            grow_size = new_cap - current_cap
-            if grow_size <= 0:
-                continue
-
-            new_hisparse_indices = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(grow_size)
-            )
-            if new_hisparse_indices is None:
-                logger.error(
-                    "HiSparse: _grow_device_buffers failed for req pool idx %d "
-                    "(current_cap=%d, new_cap=%d, grow_size=%d)",
-                    req_idx,
-                    current_cap,
-                    new_cap,
-                    grow_size,
-                )
-                raise RuntimeError(
-                    f"HiSparse _grow_device_buffers failed (grow_size={grow_size})"
-                )
-
-            self.req_to_device_buffer[req_idx, current_cap:new_cap] = (
-                new_hisparse_indices
-            )
-            self.req_device_buffer_token_locs[:, req_idx, current_cap:new_cap] = (
-                new_hisparse_indices
-            )
-            self.req_device_buffer_size[req_idx] = new_cap
+        return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
     def map_last_loc_to_buffer(
         self,
@@ -311,18 +302,8 @@ class HiSparseCoordinator:
         req_pool_indices: torch.Tensor,
     ) -> None:
         self._eager_backup_previous_token(seq_lens, req_pool_indices)
-        # Grow device buffers for requests that need more space before mapping.
-        self._grow_device_buffers(seq_lens, req_pool_indices)
-
-        reserved_buffer_loc = self.req_to_device_buffer[
-            req_pool_indices, self.device_buffer_size
-        ]
-
-        short_reqs = seq_lens <= self.device_buffer_size
-        if torch.any(short_reqs):
-            reserved_buffer_loc[short_reqs] = self.req_to_device_buffer[
-                req_pool_indices[short_reqs], seq_lens[short_reqs] - 1
-            ]
+        # Grow device buffers if needed and resolve the latest-token slot.
+        reserved_buffer_loc = self._grow_device_buffers(seq_lens, req_pool_indices)
 
         self.req_device_buffer_token_locs[
             :, req_pool_indices, self.device_buffer_size
@@ -338,36 +319,22 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ) -> None:
-        """Back up the previous decode token from the reserved device buffer slot.
-
-        Called at the start of map_last_loc_to_buffer (inside prepare_for_decode)
-        so the backup runs on the default stream *before* the forward overwrites
-        the reserved slot.
-
-        For long sequences, at every decode step the token at position
-        seq_len - 2 needs a host backup — except on the very first decode,
-        where that position is a prefill token already backed up during
-        staging (detected by req_to_host_pool >= 0).
-        """
+        """Back up the previous decode token from the reserved device buffer slot."""
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
 
-        prev_pos = seq_lens - 2
-        long_mask = (prev_pos >= 0) & (seq_lens > self.device_buffer_size)
-        if not torch.any(long_mask):
-            return
-
-        candidate_reqs = req_pool_indices[long_mask]
-        candidate_pos = prev_pos[long_mask]
+        last_token_loc = torch.minimum(
+            seq_lens - 2,
+            torch.full_like(seq_lens, self.device_buffer_size),
+        )
 
         # Skip positions already backed up (first decode after prefill)
-        needs_backup = self.req_to_host_pool[candidate_reqs, candidate_pos] < 0
+        needs_backup = self.req_to_host_pool[req_pool_indices, last_token_loc] < 0
         if not torch.any(needs_backup):
             return
 
-        backup_req_indices = candidate_reqs[needs_backup]
-        backup_positions = candidate_pos[needs_backup]
-
+        backup_req_indices = req_pool_indices[needs_backup]
+        backup_positions = last_token_loc[needs_backup]
         device_locs = self.req_to_device_buffer[
             backup_req_indices, self.device_buffer_size
         ]
@@ -562,7 +529,7 @@ class HiSparseCoordinator:
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
         self.residency_map.fill_(-1)
-        # adjustable for performance
+        # todo, adjustable for performance
         block_size = 512
         load_cache_to_device_buffer_mla(
             top_k_tokens=top_k_result,
