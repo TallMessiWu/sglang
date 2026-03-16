@@ -648,6 +648,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_query,
             joint_key,
             joint_value,
+            num_replicated_prefix=seq_len_txt,
         )
 
         # Reshape back
