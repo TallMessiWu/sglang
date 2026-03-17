@@ -4,6 +4,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -121,6 +122,19 @@ def _record_zimage_debug_tensor(
     )
 
 
+def _dump_debug_tensor(path: str | None, tensor: torch.Tensor) -> None:
+    if not path:
+        return
+    torch.save(tensor.detach().float().cpu(), path)
+
+
+def _debug_context_layer_matches(layer_id: int) -> bool:
+    target = os.getenv("SGLANG_DEBUG_ZIMAGE_CONTEXT_LAYER_ID")
+    if target is None:
+        return layer_id == 0
+    return layer_id == int(target)
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
         super().__init__()
@@ -179,10 +193,45 @@ class FeedForward(nn.Module):
         self.act = SiluAndMul()
 
     def forward(self, x):
+        if os.getenv("SGLANG_DEBUG_ZIMAGE_REF_CONTEXT_FFN_FULL") == "1":
+            hidden_dim = self.w2.input_size
+            w13 = self.w13.weight
+            gate = F.linear(x, w13[:hidden_dim])
+            up = F.linear(x, w13[hidden_dim:])
+            x = F.silu(gate) * up
+            return F.linear(x, self.w2.weight)
+        if os.getenv("SGLANG_DEBUG_ZIMAGE_REF_CONTEXT_FFN_SWAP") == "1":
+            hidden_dim = self.w2.input_size
+            w13 = self.w13.weight
+            gate = F.linear(x, w13[hidden_dim:])
+            up = F.linear(x, w13[:hidden_dim])
+            x = F.silu(gate) * up
+            return F.linear(x, self.w2.weight)
         x13, _ = self.w13(x)
-        x = self.act(x13)
+        if os.getenv("SGLANG_DEBUG_ZIMAGE_REF_CONTEXT_FFN") == "1":
+            x = self.act.forward_native(x13)
+        else:
+            x = self.act(x13)
         out, _ = self.w2(x)
         return out
+
+    def reference_forward_fp32(self, x: torch.Tensor) -> torch.Tensor:
+        hidden_dim = self.w2.input_size
+        w13 = self.w13.weight.float()
+        w2 = self.w2.weight.float()
+        gate = F.linear(x.float(), w13[:hidden_dim])
+        up = F.linear(x.float(), w13[hidden_dim:])
+        x = F.silu(gate) * up
+        return F.linear(x, w2)
+
+    def reference_forward_official(self, x: torch.Tensor) -> torch.Tensor:
+        hidden_dim = self.w2.input_size
+        w13 = self.w13.weight.to(dtype=x.dtype)
+        w2 = self.w2.weight.to(dtype=x.dtype)
+        gate = F.linear(x, w13[:hidden_dim])
+        up = F.linear(x, w13[hidden_dim:])
+        x = F.silu(gate) * up
+        return F.linear(x, w2)
 
 
 class ZImageAttention(nn.Module):
@@ -383,6 +432,157 @@ class ZImageAttention(nn.Module):
 
         return hidden_states
 
+    def reference_forward(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        q, _ = self.to_q(hidden_states)
+        k, _ = self.to_k(hidden_states)
+        v, _ = self.to_v(hidden_states)
+
+        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
+
+        if self.qk_norm:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                allow_inplace=False,
+            )
+
+        if freqs_cis is not None:
+            cos, sin = freqs_cis
+            freqs_cis_complex = torch.polar(
+                torch.ones_like(cos, dtype=torch.float32),
+                torch.atan2(sin.float(), cos.float()),
+            )
+
+            def apply_rotary_emb_reference(
+                x_in: torch.Tensor, freqs: torch.Tensor
+            ) -> torch.Tensor:
+                with torch.amp.autocast("cuda", enabled=False):
+                    x_complex = torch.view_as_complex(
+                        x_in.float().reshape(*x_in.shape[:-1], -1, 2)
+                    )
+                    x_out = torch.view_as_real(x_complex * freqs.unsqueeze(1)).flatten(3)
+                    return x_out.type_as(x_in)
+
+            q = apply_rotary_emb_reference(q, freqs_cis_complex)
+            k = apply_rotary_emb_reference(k, freqs_cis_complex)
+
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)
+        out = out.flatten(2)
+        out, _ = self.to_out[0](out)
+        return out
+
+    def reference_forward_fp32(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        q = F.linear(hidden_states.float(), self.to_q.weight.float())
+        k = F.linear(hidden_states.float(), self.to_k.weight.float())
+        v = F.linear(hidden_states.float(), self.to_v.weight.float())
+
+        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
+
+        if self.qk_norm:
+            q = self.norm_q.forward_native(q.float())
+            k = self.norm_k.forward_native(k.float())
+
+        if freqs_cis is not None:
+            cos, sin = freqs_cis
+            freqs_cis_complex = torch.polar(
+                torch.ones_like(cos, dtype=torch.float32),
+                torch.atan2(sin.float(), cos.float()),
+            )
+
+            def apply_rotary_emb_reference(
+                x_in: torch.Tensor, freqs: torch.Tensor
+            ) -> torch.Tensor:
+                with torch.amp.autocast("cuda", enabled=False):
+                    x_complex = torch.view_as_complex(
+                        x_in.float().reshape(*x_in.shape[:-1], -1, 2)
+                    )
+                    x_out = torch.view_as_real(x_complex * freqs.unsqueeze(1)).flatten(3)
+                    return x_out.float()
+
+            q = apply_rotary_emb_reference(q, freqs_cis_complex)
+            k = apply_rotary_emb_reference(k, freqs_cis_complex)
+
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2).float(),
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)
+        out = out.flatten(2)
+        return F.linear(out, self.to_out[0].weight.float())
+
+    def reference_forward_official(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        weight_dtype = hidden_states.dtype
+        q = F.linear(hidden_states, self.to_q.weight.to(dtype=weight_dtype))
+        k = F.linear(hidden_states, self.to_k.weight.to(dtype=weight_dtype))
+        v = F.linear(hidden_states, self.to_v.weight.to(dtype=weight_dtype))
+
+        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
+
+        if self.qk_norm:
+            q = self.norm_q.forward_native(q)
+            k = self.norm_k.forward_native(k)
+
+        if freqs_cis is not None:
+            cos, sin = freqs_cis
+            freqs_cis_complex = torch.complex(cos.float(), sin.float())
+
+            def apply_rotary_emb_reference(
+                x_in: torch.Tensor, freqs: torch.Tensor
+            ) -> torch.Tensor:
+                with torch.amp.autocast(current_platform.device_type, enabled=False):
+                    x_complex = torch.view_as_complex(
+                        x_in.float().reshape(*x_in.shape[:-1], -1, 2)
+                    )
+                    x_out = torch.view_as_real(x_complex * freqs.unsqueeze(1)).flatten(3)
+                    return x_out.to(dtype=x_in.dtype)
+
+            q = apply_rotary_emb_reference(q, freqs_cis_complex)
+            k = apply_rotary_emb_reference(k, freqs_cis_complex)
+
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)
+        out = out.flatten(2)
+        return F.linear(out, self.to_out[0].weight.to(dtype=out.dtype))
+
 
 class ZImageTransformerBlock(nn.Module):
     def __init__(
@@ -463,6 +663,9 @@ class ZImageTransformerBlock(nn.Module):
         adaln_input: Optional[torch.Tensor] = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        force_fp32_reference: bool = False,
+        force_official_semantic: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -489,21 +692,95 @@ class ZImageTransformerBlock(nn.Module):
                 )
             )
         else:
+            if force_official_semantic:
+                context_dump_prefix = os.getenv("SGLANG_DEBUG_ZIMAGE_CONTEXT_PARTS_PREFIX")
+                attn_input = self.attention_norm1.forward_native(x)
+                attn_out = self.attention.reference_forward_official(
+                    attn_input,
+                    freqs_cis=freqs_cis,
+                    attention_mask=attention_mask,
+                )
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.attn_input.pt", attn_input)
+                    _dump_debug_tensor(f"{context_dump_prefix}.attn_out.pt", attn_out)
+                x = x + self.attention_norm2.forward_native(attn_out)
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.after_attn.pt", x)
+                ffn_input = self.ffn_norm1.forward_native(x)
+                ffn_out = self.feed_forward.reference_forward_official(ffn_input)
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.ffn_input.pt", ffn_input)
+                    _dump_debug_tensor(f"{context_dump_prefix}.ffn_out.pt", ffn_out)
+                x = x + self.ffn_norm2.forward_native(ffn_out)
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.after_ffn.pt", x)
+                return x
+            if force_fp32_reference:
+                context_dump_prefix = os.getenv("SGLANG_DEBUG_ZIMAGE_CONTEXT_PARTS_PREFIX")
+                x = x.float()
+                freqs_cis = (freqs_cis[0].float(), freqs_cis[1].float())
+                attn_input = self.attention_norm1.forward_native(x)
+                attn_out = self.attention.reference_forward_fp32(
+                    attn_input,
+                    freqs_cis=freqs_cis,
+                )
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.attn_input.pt", attn_input)
+                    _dump_debug_tensor(f"{context_dump_prefix}.attn_out.pt", attn_out)
+                x = x + self.attention_norm2.forward_native(attn_out)
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.after_attn.pt", x)
+                ffn_input = self.ffn_norm1.forward_native(x)
+                ffn_out = self.feed_forward.reference_forward_fp32(ffn_input)
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.ffn_input.pt", ffn_input)
+                    _dump_debug_tensor(f"{context_dump_prefix}.ffn_out.pt", ffn_out)
+                x = x + self.ffn_norm2.forward_native(ffn_out)
+                if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                    _dump_debug_tensor(f"{context_dump_prefix}.after_ffn.pt", x)
+                return x
             # Attention block
-            attn_out = self.attention(
-                self.attention_norm1(x),
-                freqs_cis=freqs_cis,
-                num_replicated_prefix=num_replicated_prefix,
-                num_replicated_suffix=num_replicated_suffix,
-            )
+            attn_input = self.attention_norm1(x)
+            if os.getenv("SGLANG_DEBUG_ZIMAGE_REF_CONTEXT_ATTN") == "1":
+                attn_out = self.attention.reference_forward(
+                    attn_input,
+                    freqs_cis=freqs_cis,
+                )
+            else:
+                attn_out = self.attention(
+                    attn_input,
+                    freqs_cis=freqs_cis,
+                    num_replicated_prefix=num_replicated_prefix,
+                    num_replicated_suffix=num_replicated_suffix,
+                )
+            context_dump_prefix = os.getenv("SGLANG_DEBUG_ZIMAGE_CONTEXT_PARTS_PREFIX")
+            if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                _dump_debug_tensor(f"{context_dump_prefix}.attn_input.pt", attn_input)
+                _dump_debug_tensor(f"{context_dump_prefix}.attn_out.pt", attn_out)
             x = x + self.attention_norm2(attn_out)
+            if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                _dump_debug_tensor(f"{context_dump_prefix}.after_attn.pt", x)
 
             # FFN block
-            x = x + self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x),
-                )
+            ffn_input = self.ffn_norm1(x)
+            ffn_out = self.feed_forward(
+                ffn_input,
             )
+            if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                _dump_debug_tensor(f"{context_dump_prefix}.ffn_input.pt", ffn_input)
+                _dump_debug_tensor(f"{context_dump_prefix}.ffn_out.pt", ffn_out)
+                if hasattr(self.feed_forward, "w13") and hasattr(self.feed_forward, "w2"):
+                    _dump_debug_tensor(
+                        f"{context_dump_prefix}.ffn_w13_weight.pt",
+                        self.feed_forward.w13.weight,
+                    )
+                    _dump_debug_tensor(
+                        f"{context_dump_prefix}.ffn_w2_weight.pt",
+                        self.feed_forward.w2.weight,
+                    )
+            x = x + self.ffn_norm2(ffn_out)
+            if context_dump_prefix and _debug_context_layer_matches(self.layer_id):
+                _dump_debug_tensor(f"{context_dump_prefix}.after_ffn.pt", x)
 
         return x
 
@@ -789,15 +1066,15 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         pH = pW = patch_size
         pF = f_patch_size
         device = image.device
-        pad_to_seq_multiple = get_sp_world_size() > 1
-
         all_image_out = []
         all_image_size = []
         all_cap_feats_out = []
+        all_image_valid_lens = []
+        all_cap_valid_lens = []
 
         # ------------ Process Caption ------------
         cap_ori_len = cap_feat.size(0)
-        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF if pad_to_seq_multiple else 0
+        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
 
         # padded feature
         cap_padded_feat = torch.cat(
@@ -805,6 +1082,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             dim=0,
         )
         all_cap_feats_out.append(cap_padded_feat)
+        all_cap_valid_lens.append(cap_ori_len)
 
         # ------------ Process Image ------------
         C, F, H, W = image.size()
@@ -817,9 +1095,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             F_tokens * H_tokens * W_tokens, pF * pH * pW * C
         )
         image_ori_len = image.size(0)
-        image_padding_len = (
-            (-image_ori_len) % SEQ_MULTI_OF if pad_to_seq_multiple else 0
-        )
+        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
 
         # padded feature
         image_padded_feat = torch.cat(
@@ -827,11 +1103,14 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             dim=0,
         )
         all_image_out.append(image_padded_feat)
+        all_image_valid_lens.append(image_ori_len)
 
         return (
             all_image_out,
             all_cap_feats_out,
             all_image_size,
+            all_image_valid_lens,
+            all_cap_valid_lens,
         )
 
     def forward(
@@ -863,10 +1142,14 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             x,
             cap_feats,
             x_size,
+            x_valid_lens,
+            cap_valid_lens,
         ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+        if x_valid_lens[0] < x.shape[0]:
+            x[x_valid_lens[0] :] = self.x_pad_token.to(dtype=x.dtype)
         x_freqs_cis = freqs_cis[1]
 
         x = x.unsqueeze(0)
@@ -884,22 +1167,41 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         cap_feats = torch.cat(cap_feats, dim=0)
 
         cap_feats, _ = self.cap_embedder(cap_feats)
+        if cap_valid_lens[0] < cap_feats.shape[0]:
+            cap_feats[cap_valid_lens[0] :] = self.cap_pad_token.to(
+                dtype=cap_feats.dtype
+            )
 
         cap_freqs_cis = freqs_cis[0]
 
         cap_feats = cap_feats.unsqueeze(0)
+        context_refiner_fp32 = os.getenv("SGLANG_DEBUG_ZIMAGE_REF_CONTEXT_FP32") == "1"
+        context_refiner_official = (
+            os.getenv("SGLANG_DEBUG_ZIMAGE_REF_CONTEXT_OFFICIAL") == "1"
+        )
+        cap_input_dtype = cap_feats.dtype
+        if context_refiner_fp32:
+            cap_feats = cap_feats.float()
+            cap_freqs_cis = (cap_freqs_cis[0].float(), cap_freqs_cis[1].float())
         _record_zimage_debug_tensor(
             "context_refiner.input",
             cap_feats,
             already_replicated=True,
         )
         for layer_id, layer in enumerate(self.context_refiner):
-            cap_feats = layer(cap_feats, cap_freqs_cis)
+            cap_feats = layer(
+                cap_feats,
+                cap_freqs_cis,
+                force_fp32_reference=context_refiner_fp32,
+                force_official_semantic=context_refiner_official,
+            )
             _record_zimage_debug_tensor(
                 f"context_refiner.{layer_id}",
                 cap_feats,
                 already_replicated=True,
             )
+        if context_refiner_fp32:
+            cap_feats = cap_feats.to(cap_input_dtype)
 
         cap_seq_len = cap_feats.shape[1]
         use_full_unified_sequence = (

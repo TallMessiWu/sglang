@@ -247,7 +247,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return (cap_freqs_cis, x_freqs_cis)
 
         cap_ori_len = prompt_embeds.size(0)
-        cap_padding_len = 0 if sp_size <= 1 else (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
+        cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
         cap_padded_pos_ids = create_coordinate_grid(
             size=(cap_ori_len + cap_padding_len, 1, 1),
             start=(1, 0, 0),
@@ -262,9 +262,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         pF = self.F_PATCH_SIZE
         F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
         image_ori_len = F_tokens * H_tokens * W_tokens
-        image_padding_len = (
-            0 if sp_size <= 1 else (-image_ori_len) % self.SEQ_LEN_MULTIPLE
-        )
+        image_padding_len = (-image_ori_len) % self.SEQ_LEN_MULTIPLE
 
         image_ori_pos_ids = create_coordinate_grid(
             size=(F_tokens, H_tokens, W_tokens),
