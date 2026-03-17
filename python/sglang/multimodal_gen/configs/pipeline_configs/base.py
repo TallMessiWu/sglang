@@ -314,6 +314,9 @@ class PipelineConfig:
 
         return shape
 
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        return prompt_dtype
+
     def allow_set_num_frames(self):
         return False
 

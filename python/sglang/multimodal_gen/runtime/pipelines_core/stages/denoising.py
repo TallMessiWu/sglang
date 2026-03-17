@@ -1078,9 +1078,10 @@ class DenoisingStage(PipelineStage):
 
                         # Optional debug hook to surface one-step noise_pred from
                         # the standard pipeline without changing default behavior.
-                        if server_args.comfyui_mode or os.getenv(
-                            "SGLANG_DEBUG_KEEP_NOISE_PRED"
-                        ) == "1":
+                        if (
+                            server_args.comfyui_mode
+                            or os.getenv("SGLANG_DEBUG_KEEP_NOISE_PRED") == "1"
+                        ):
                             batch.noise_pred = noise_pred
 
                         # Compute the previous noisy sample

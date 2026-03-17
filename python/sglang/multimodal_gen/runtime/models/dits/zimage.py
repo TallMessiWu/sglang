@@ -16,7 +16,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
-from sglang.multimodal_gen.runtime.layers.attention import UlyssesAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    UlyssesAttention,
+    USPAttention,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -344,9 +347,18 @@ class ZImageAttention(nn.Module):
             and get_sp_world_size() > 1
             and get_ring_parallel_world_size() == 1
         ):
-            q_shard, q_rep = q[:, :-num_replicated_suffix], q[:, -num_replicated_suffix:]
-            k_shard, k_rep = k[:, :-num_replicated_suffix], k[:, -num_replicated_suffix:]
-            v_shard, v_rep = v[:, :-num_replicated_suffix], v[:, -num_replicated_suffix:]
+            q_shard, q_rep = (
+                q[:, :-num_replicated_suffix],
+                q[:, -num_replicated_suffix:],
+            )
+            k_shard, k_rep = (
+                k[:, :-num_replicated_suffix],
+                k[:, -num_replicated_suffix:],
+            )
+            v_shard, v_rep = (
+                v[:, :-num_replicated_suffix],
+                v[:, -num_replicated_suffix:],
+            )
             hidden_states, hidden_states_rep = self.ulysses_attn(
                 q_shard,
                 k_shard,
@@ -777,6 +789,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         pH = pW = patch_size
         pF = f_patch_size
         device = image.device
+        pad_to_seq_multiple = get_sp_world_size() > 1
 
         all_image_out = []
         all_image_size = []
@@ -784,7 +797,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         # ------------ Process Caption ------------
         cap_ori_len = cap_feat.size(0)
-        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF if pad_to_seq_multiple else 0
 
         # padded feature
         cap_padded_feat = torch.cat(
@@ -804,7 +817,9 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             F_tokens * H_tokens * W_tokens, pF * pH * pW * C
         )
         image_ori_len = image.size(0)
-        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        image_padding_len = (
+            (-image_ori_len) % SEQ_MULTI_OF if pad_to_seq_multiple else 0
+        )
 
         # padded feature
         image_padded_feat = torch.cat(

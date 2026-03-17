@@ -46,6 +46,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen3TextConfig(),)
     )
@@ -62,19 +63,22 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     F_PATCH_SIZE: int = 1
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        inputs = tokenizer.apply_chat_template(
-            prompts,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=True,
+        rendered_prompts = [
+            tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            for prompt in prompts
+        ]
+        return tokenizer(
+            rendered_prompts,
             padding="max_length",
             max_length=512,  # TODO (yhyang201): set max length according to config
             truncation=True,
             return_tensors="pt",
-            return_dict=True,
         )
-        return inputs
 
     @staticmethod
     def _ceil_to_multiple(x: int, m: int) -> int:
@@ -138,6 +142,11 @@ class ZImagePipelineConfig(ImagePipelineConfig):
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
+
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        # Match the official diffusers Z-Image pipeline, which samples latents in fp32
+        # and keeps scheduler state in fp32.
+        return torch.float32
 
     def shard_latents_for_sp(self, batch, latents):
         sp_size = get_sp_world_size()
@@ -238,7 +247,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return (cap_freqs_cis, x_freqs_cis)
 
         cap_ori_len = prompt_embeds.size(0)
-        cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
+        cap_padding_len = 0 if sp_size <= 1 else (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
         cap_padded_pos_ids = create_coordinate_grid(
             size=(cap_ori_len + cap_padding_len, 1, 1),
             start=(1, 0, 0),
@@ -253,7 +262,9 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         pF = self.F_PATCH_SIZE
         F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
         image_ori_len = F_tokens * H_tokens * W_tokens
-        image_padding_len = (-image_ori_len) % self.SEQ_LEN_MULTIPLE
+        image_padding_len = (
+            0 if sp_size <= 1 else (-image_ori_len) % self.SEQ_LEN_MULTIPLE
+        )
 
         image_ori_pos_ids = create_coordinate_grid(
             size=(F_tokens, H_tokens, W_tokens),
