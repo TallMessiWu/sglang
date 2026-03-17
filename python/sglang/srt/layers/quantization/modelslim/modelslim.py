@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimMXFP8,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
@@ -188,6 +189,10 @@ class ModelSlimConfig(QuantizationConfig):
             )
         elif quant_type == "W4A4_DYNAMIC":
             return ModelSlimW4A4Int4(
+                quant_config=self.quant_description, prefix=layer_name
+            )
+        elif quant_type == "W8A8_MXFP8":
+            return ModelSlimMXFP8(
                 quant_config=self.quant_description, prefix=layer_name
             )
         raise NotImplementedError("No modelslim compatible scheme was found.")
