@@ -93,7 +93,9 @@ class TextEncoderLoader(ComponentLoader):
                 component_model_path, server_args, transformers_or_diffusers
             )
 
-        encoder_idx = 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+        encoder_idx = (
+            1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+        )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
         return AutoModel.from_pretrained(
             component_model_path,

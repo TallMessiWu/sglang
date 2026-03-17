@@ -83,7 +83,9 @@ class LatentPreparationStage(PipelineStage):
         batch_size = batch.batch_size
 
         # Get required parameters
-        dtype = server_args.pipeline_config.get_latent_dtype(batch.prompt_embeds[0].dtype)
+        dtype = server_args.pipeline_config.get_latent_dtype(
+            batch.prompt_embeds[0].dtype
+        )
         device = get_local_torch_device()
         generator = batch.generator
         latents = batch.latents
