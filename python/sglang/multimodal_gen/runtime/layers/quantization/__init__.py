@@ -7,8 +7,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu import MXFP8Config
 
-QuantizationMethods = Literal["fp8", "modelslim"]
+QuantizationMethods = Literal["fp8", "modelslim", "mxfp8"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -16,6 +17,7 @@ QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "modelslim": ModelSlimConfig,
     "fp8": Fp8Config,
+    "mxfp8": MXFP8Config,
 }
 
 

@@ -82,7 +82,16 @@ class TransformerLoader(ComponentLoader):
         safetensors_list: list[str],
         component_model_path: str,
     ) -> Optional[dict]:
-        # priority: model config.json → safetensors metadata → nunchaku config
+        # priority: explicit --quantization flag → model config.json
+        #         → safetensors metadata → nunchaku config
+        if server_args.quantization is not None:
+            from sglang.multimodal_gen.runtime.layers.quantization import (
+                get_quantization_config,
+            )
+
+            quant_cls = get_quantization_config(server_args.quantization)
+            return quant_cls.from_config({})
+
         quant_config = get_quant_config(hf_config, component_model_path)
         if quant_config is None and server_args.transformer_weights_path:
             # try to read quantization_config from the safetensors metadata header
