@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.srt.utils import add_prefix
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -113,6 +114,7 @@ class SelfAttention(nn.Module):
         num_heads: int,
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -128,16 +130,20 @@ class SelfAttention(nn.Module):
 
         # TP strategy: shard Q/K/V over heads (column-parallel), then row-parallel output.
         self.q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config,
+            prefix=add_prefix("q", prefix),
         )
         self.k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config,
+            prefix=add_prefix("k", prefix),
         )
         self.v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config,
+            prefix=add_prefix("v", prefix),
         )
         self.o = RowParallelLinear(
-            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
+            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config,
+            prefix=add_prefix("o", prefix),
         )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
@@ -211,6 +217,7 @@ class CrossAttention(nn.Module):
         num_heads: int,
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -225,16 +232,20 @@ class CrossAttention(nn.Module):
         self.num_heads_per_rank = self.num_heads // self.tp_size
 
         self.q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config,
+            prefix=add_prefix("q", prefix),
         )
         self.k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config,
+            prefix=add_prefix("k", prefix),
         )
         self.v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, dim, bias=True, gather_output=False, quant_config=quant_config,
+            prefix=add_prefix("v", prefix),
         )
         self.o = RowParallelLinear(
-            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config
+            dim, dim, bias=True, input_is_parallel=True, quant_config=quant_config,
+            prefix=add_prefix("o", prefix),
         )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
@@ -296,14 +307,17 @@ class DiTBlock(nn.Module):
         ffn_dim: int,
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps, quant_config=quant_config)
-        self.cross_attn = CrossAttention(dim, num_heads, eps, quant_config=quant_config)
+        self.self_attn = SelfAttention(dim, num_heads, eps, quant_config=quant_config,
+                                       prefix=add_prefix("self_attn", prefix))
+        self.cross_attn = CrossAttention(dim, num_heads, eps, quant_config=quant_config,
+                                         prefix=add_prefix("cross_attn", prefix))
         self.norm1 = LayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
@@ -319,6 +333,7 @@ class DiTBlock(nn.Module):
             output_dim=dim,
             act_type="gelu_pytorch_tanh",
             quant_config=quant_config,
+            prefix=add_prefix("ffn", prefix),
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.mlp_residual = MulAdd()
@@ -445,12 +460,12 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         patch_size = config.patch_size
         num_heads = config.num_heads
         num_layers = config.num_layers
-        has_image_pos_emb = config.has_image_pos_emb
-        has_ref_conv = config.has_ref_conv
-        separated_timestep = config.separated_timestep
-        require_vae_embedding = config.require_vae_embedding
-        require_clip_embedding = config.require_clip_embedding
-        fuse_vae_embedding_in_latents = config.fuse_vae_embedding_in_latents
+        has_image_pos_emb = getattr(config, "has_image_pos_emb", False)
+        has_ref_conv = getattr(config, "has_ref_conv", False)
+        separated_timestep = getattr(config, "separated_timestep", False)
+        require_vae_embedding = getattr(config, "require_vae_embedding", True)
+        require_clip_embedding = getattr(config, "require_clip_embedding", True)
+        fuse_vae_embedding_in_latents = getattr(config, "fuse_vae_embedding_in_latents", False)
 
         self.dim = dim
         self.freq_dim = freq_dim
@@ -469,18 +484,22 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             output_dim=dim,
             act_type="gelu_pytorch_tanh",
             quant_config=quant_config,
+            prefix="text_embedding",
         )
         self.time_embedding = MLP(
-            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
+            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config,
+            prefix="time_embedding",
         )
         # Preserve state_dict keys (time_projection.1.weight/bias).
         self.time_projection = nn.Sequential(
-            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
+            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config,
+                                        prefix="time_projection.1")
         )
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
-                for _ in range(num_layers)
+                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config,
+                         prefix=f"blocks.{i}")
+                for i in range(num_layers)
             ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
