@@ -167,6 +167,10 @@ class ServerArgs:
 
     disable_autocast: bool | None = None
 
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader will use this instead of auto-detection.
+    quantization: str | None = None
+
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
