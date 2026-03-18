@@ -8,7 +8,7 @@ from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
 )
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+from sglang.srt.layers.quantization.modelslim.schemes.modelslim_scheme import ModelSlimLinearScheme
 
 
 class ModelSlimMXFP8(ModelSlimLinearScheme):
