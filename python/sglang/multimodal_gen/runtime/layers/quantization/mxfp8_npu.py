@@ -113,6 +113,10 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
 
+        # Ensure weight is on NPU before calling npu_dynamic_mx_quant
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.npu()
+
         # Online MXFP8 quantisation of weights (block_size=32)
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=torch_npu.float8_e4m3fn
@@ -133,6 +137,13 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
             x = x.to(torch.bfloat16)
             original_dtype = torch.bfloat16
 
+        # npu_quant_matmul requires 3D input; flatten leading dims if needed
+        input_shape = x.shape
+        if x.dim() > 3:
+            x = x.reshape(-1, x.shape[-2], x.shape[-1])
+        elif x.dim() == 2:
+            x = x.unsqueeze(0)
+
         # Dynamic MXFP8 activation quantisation
         qx, input_scale = torch_npu.npu_dynamic_mx_quant(
             x, dst_type=torch_npu.float8_e4m3fn
@@ -150,4 +161,10 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
             output_dtype=original_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
         )
+
+        # Restore original shape (replace last dim with output features)
+        if len(input_shape) != 3:
+            output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+            output = output.reshape(output_shape)
+
         return output
