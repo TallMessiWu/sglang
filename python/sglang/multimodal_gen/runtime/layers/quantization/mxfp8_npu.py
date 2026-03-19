@@ -137,16 +137,13 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
             x = x.to(torch.bfloat16)
             original_dtype = torch.bfloat16
 
-        # npu_quant_matmul requires 3D input; flatten leading dims if needed
+        # Flatten to 2D [tokens, hidden] so npu_dynamic_mx_quant returns 3D scale
         input_shape = x.shape
-        if x.dim() > 3:
-            x = x.reshape(-1, x.shape[-2], x.shape[-1])
-        elif x.dim() == 2:
-            x = x.unsqueeze(0)
+        x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic MXFP8 activation quantisation
         qx, input_scale = torch_npu.npu_dynamic_mx_quant(
-            x, dst_type=torch_npu.float8_e4m3fn
+            x_2d, dst_type=torch_npu.float8_e4m3fn
         )
 
         # MXFP8 matmul
@@ -163,8 +160,7 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
         )
 
         # Restore original shape (replace last dim with output features)
-        if len(input_shape) != 3:
-            output_shape = list(input_shape[:-1]) + [output.shape[-1]]
-            output = output.reshape(output_shape)
+        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+        output = output.reshape(output_shape)
 
         return output
