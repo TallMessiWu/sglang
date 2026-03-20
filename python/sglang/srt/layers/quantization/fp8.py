@@ -223,11 +223,7 @@ class Fp8Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             if _is_npu and self.use_mxfp8:
-                from sglang.srt.hardware_backend.npu.quantization.mxfp8_method_npu import (
-                    NPUMXFP8LinearMethod,
-                )
-
-                return NPUMXFP8LinearMethod(self)
+                return MXFP8LinearAscendMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
@@ -243,6 +239,99 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class MXFP8LinearAscendMethod(LinearMethodBase):
+    """Ascend NPU MXFP8 (Microscaling FP8) quantization for Linear layers.
+
+    Supports two modes:
+    - Online quantization: loads FP16/BF16 weights and quantizes them to MXFP8
+      at weight loading time.
+    - Offline quantization: loads pre-quantized FP8 weights with block scales
+      from a serialized checkpoint.
+
+    Weight creation is handled here; weight processing and kernel calls are
+    delegated to NPUMXFP8LinearMethod in the NPU hardware backend.
+    """
+
+    MXFP8_BLOCK_SIZE = 32
+
+    def __init__(self, quant_config: Fp8Config):
+        self.quant_config = quant_config
+
+        from sglang.srt.hardware_backend.npu.quantization.mxfp8_method_npu import (
+            NPUMXFP8LinearMethod
+        )
+
+        self.npu_method = NPUMXFP8LinearMethod()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        is_serialized = self.quant_config.is_checkpoint_fp8_serialized
+
+        # Weight: fp8 if serialized checkpoint, else original dtype (will be
+        # quantized in process_weights_after_loading)
+        weight_dtype = torch.float8_e4m3fn if is_serialized else params_dtype
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=weight_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        if is_serialized:
+            # Block scale: one scale per block of 32 elements along input dim.
+            # Stored as uint8 (representing float8_e8m0fnu) in checkpoint.
+            block_k = self.MXFP8_BLOCK_SIZE
+            scale_cols = (input_size_per_partition + block_k - 1) // block_k
+            scale = BlockQuantScaleParameter(
+                data=torch.zeros(
+                    output_size_per_partition,
+                    scale_cols,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            scale.format_ue8m0 = True
+            layer.register_parameter("weight_scale_inv", scale)
+        else:
+            layer.register_parameter("weight_scale_inv", None)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        self.npu_method.process_weights_after_loading(
+            layer, self.quant_config.is_checkpoint_fp8_serialized
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.npu_method.apply(layer, x, bias)
 
 
 class Fp8LinearMethod(LinearMethodBase):

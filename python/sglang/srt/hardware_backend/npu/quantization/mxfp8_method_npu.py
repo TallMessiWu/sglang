@@ -1,96 +1,26 @@
-from typing import TYPE_CHECKING, List, Optional
+from typing import Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.parameter import (
-    BlockQuantScaleParameter,
-    ModelWeightParameter,
-)
-from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
-if TYPE_CHECKING:
-    from sglang.srt.layers.quantization.fp8 import Fp8Config
+class NPUMXFP8LinearMethod:
+    """Ascend NPU MXFP8 weight processing and kernel calls.
 
+    This class handles NPU-specific operations:
+    - process_weights_after_loading: dtype casting and online quantization
+    - apply: dynamic activation quantization + MXFP8 matmul
 
-class NPUMXFP8LinearMethod(LinearMethodBase):
-    """Ascend NPU MXFP8 (Microscaling FP8) quantization for Linear layers.
-
-    Supports two modes:
-    - Online quantization: loads FP16/BF16 weights and quantizes them to MXFP8
-      at weight loading time.
-    - Offline quantization: loads pre-quantized FP8 weights with block scales
-      from a serialized checkpoint.
-
-    Uses torch_npu APIs:
-    - npu_dynamic_mx_quant: dynamic MXFP8 activation quantization (block_size=32)
-    - npu_quant_matmul: MXFP8 matrix multiplication with group_sizes=[1,1,32]
+    Weight creation and config management are handled by
+    MXFP8LinearAscendMethod in fp8.py.
     """
 
     MXFP8_BLOCK_SIZE = 32
 
-    def __init__(self, quant_config: "Fp8Config"):
-        self.quant_config = quant_config
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
+    def process_weights_after_loading(
+        self, layer: torch.nn.Module, is_serialized: bool
     ):
-        output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-
-        is_serialized = self.quant_config.is_checkpoint_fp8_serialized
-
-        # Weight: fp8 if serialized checkpoint, else original dtype (will be
-        # quantized in process_weights_after_loading)
-        weight_dtype = torch.float8_e4m3fn if is_serialized else params_dtype
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
-                dtype=weight_dtype,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        if is_serialized:
-            # Block scale: one scale per block of 32 elements along input dim.
-            # Stored as uint8 (representing float8_e8m0fnu) in checkpoint.
-            block_k = self.MXFP8_BLOCK_SIZE
-            scale_cols = (input_size_per_partition + block_k - 1) // block_k
-            scale = BlockQuantScaleParameter(
-                data=torch.zeros(
-                    output_size_per_partition,
-                    scale_cols,
-                    dtype=torch.uint8,
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            )
-            scale.format_ue8m0 = True
-            layer.register_parameter("weight_scale_inv", scale)
-        else:
-            layer.register_parameter("weight_scale_inv", None)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module):
         import torch_npu
-
-        is_serialized = self.quant_config.is_checkpoint_fp8_serialized
 
         if is_serialized:
             # Checkpoint already has fp8 weights + uint8 scales.
@@ -112,6 +42,9 @@ class NPUMXFP8LinearMethod(LinearMethodBase):
             weight_fp = layer.weight.data
             if weight_fp.dtype not in (torch.float16, torch.bfloat16):
                 weight_fp = weight_fp.to(torch.bfloat16)
+
+            if not weight_fp.is_npu:
+                weight_fp = weight_fp.npu()
 
             qw, w_scale = torch_npu.npu_dynamic_mx_quant(
                 weight_fp, dst_type=torch_npu.float8_e4m3fn
