@@ -1,7 +1,7 @@
 """ModelSlim MXFP8 scheme for pre-quantized weight inference on Ascend NPU.
 
-Loads weights pre-quantized by msmodelslim (int8 storage for float8_e4m3fn,
-uint8 storage for float8_e8m0fnu scales) and runs MXFP8 matmul at inference.
+Loads weights pre-quantized by msmodelslim (float8_e4m3fn weights,
+uint8 scales) and runs MXFP8 matmul at inference.
 """
 
 from typing import Dict, List, Optional
@@ -36,11 +36,11 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
 
-        # msmodelslim exports weight as int8 (storage for float8_e4m3fn)
+        # msmodelslim exports weight as float8_e4m3fn, shape [out, in]
         weight = ModelWeightParameter(
             data=torch.empty(
                 (output_size_per_partition, input_size_per_partition),
-                dtype=torch.int8,
+                dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
             output_dim=0,
@@ -48,9 +48,8 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        # msmodelslim exports weight_scale as uint8 (storage for float8_e8m0fnu)
-        # shape: [out, in/32 * 2]
-        scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE * 2
+        # msmodelslim exports weight_scale as uint8, shape [out, in/32]
+        scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 (output_size_per_partition, scale_dim),
@@ -63,14 +62,11 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        import torch_npu
-
-        # Cast int8 → float8_e4m3fn
+        # weight is already float8_e4m3fn, no cast needed
         weight = layer.weight.data
-        weight = torch_npu.npu_dtype_cast(weight, torch_npu.float8_e4m3fn)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
-        # Reshape weight_scale: [out, in/32*2] → [out, in/32, 2]
+        # Reshape weight_scale: [out, in/32] -> [out, in/32//2, 2]
         weight_scale = layer.weight_scale.data
         weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
