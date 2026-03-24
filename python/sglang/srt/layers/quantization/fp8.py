@@ -260,7 +260,7 @@ class MXFP8LinearAscendMethod(LinearMethodBase):
         self.quant_config = quant_config
 
         from sglang.srt.hardware_backend.npu.quantization.mxfp8_method_npu import (
-            NPUMXFP8LinearMethod
+            NPUMXFP8LinearMethod,
         )
 
         self.npu_method = NPUMXFP8LinearMethod()

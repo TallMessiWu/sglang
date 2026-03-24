@@ -8,20 +8,21 @@ inference, mirroring the LLM-side ``NPUMXFP8LinearMethod``.
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch_npu
 from torch.nn.parameter import Parameter
 
-from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase, LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
 
@@ -55,8 +56,6 @@ class MXFP8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
-
         if isinstance(layer, LinearBase):
             return NPUMXFP8DiffusionLinearMethod(self)
         return None
@@ -107,15 +106,13 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        import torch_npu
 
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
 
         # Ensure weight is on NPU before calling npu_dynamic_mx_quant
-        if not weight_fp.is_npu:
-            weight_fp = weight_fp.npu()
+        assert weight_fp.is_npu
 
         # Online MXFP8 quantisation of weights (block_size=32)
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
@@ -130,8 +127,6 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import torch_npu
-
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)

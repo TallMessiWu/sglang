@@ -8,6 +8,10 @@ from typing import Any, Dict, List
 
 from safetensors.torch import load_file, save_file
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+
 TRANSFORMER_KEYS_RENAME_DICT = {
     "time_embedding.0": "condition_embedder.time_embedder.linear_1",
     "time_embedding.2": "condition_embedder.time_embedder.linear_2",
@@ -77,7 +81,11 @@ def get_quant_subpath(
 ) -> pathlib.Path:
     """Return the quant weights subdirectory for a given transformer."""
     if model_type in CASCADE_MODEL_TYPES:
-        sub = "high_noise_model" if transformer_dir == "transformer" else "low_noise_model"
+        sub = (
+            "high_noise_model"
+            if transformer_dir == "transformer"
+            else "low_noise_model"
+        )
         return quant_path / sub
     return quant_path
 
@@ -94,7 +102,7 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
         raise FileNotFoundError(
             f"Multiple files matching '{pattern}' found in {directory}: {candidates}"
         )
-    print(f"  Loading: {candidates[0].name}")
+
     state_dict = {}
     state_dict.update(load_file(candidates[0]))
     return state_dict
@@ -149,8 +157,8 @@ def repack(
     transformer_dirs = get_transformer_dirs(model_type)
 
     # Step 1: Copy original model, skipping transformer dirs (they will be replaced)
-    print(f"Step 1: Copying original model to {output_path}")
-    print(f"        (skipping: {transformer_dirs})")
+    logger.debug(f"Step 1: Copying original model to {output_path}")
+    logger.debug(f"        (skipping: {transformer_dirs})")
     shutil.copytree(
         str(original_model_path),
         str(output_path),
@@ -161,16 +169,18 @@ def repack(
     for i, tdir in enumerate(transformer_dirs):
         q_path = get_quant_subpath(model_type, quant_path, tdir)
         out_tdir = output_path / tdir
-        print(f"\nStep {i + 2}: Converting {tdir} (quant source: {q_path.name})...")
+        logger.debug(
+            f"\nStep {i + 2}: Converting {tdir} (quant source: {q_path.name})..."
+        )
         convert_transformer(model_type, q_path, out_tdir)
 
         # Copy config.json from the original transformer dir
         src_config = original_model_path / tdir / "config.json"
         if src_config.is_file():
             shutil.copy2(str(src_config), str(out_tdir / "config.json"))
-            print(f"  Copied config.json from original {tdir}/")
+            logger.debug(f"  Copied config.json from original {tdir}/")
 
-    print(f"\nDone! Repacked model saved to: {output_path}")
+    logger.info(f"\nDone! Repacked model saved to: {output_path}")
 
 
 def get_args():
