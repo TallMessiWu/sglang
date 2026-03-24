@@ -7,6 +7,7 @@ uint8 scales) and runs MXFP8 matmul at inference.
 from typing import Dict, List, Optional
 
 import torch
+import torch_npu
 
 from sglang.multimodal_gen.runtime.models.parameter import (
     GroupQuantScaleParameter,
@@ -77,14 +78,18 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import torch_npu
 
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
+            # npu_dynamic_mx_quant only accepts fp16/bf16 activations
             x = x.to(torch.bfloat16)
             original_dtype = torch.bfloat16
 
-        # Flatten to 2D for npu_dynamic_mx_quant
+        # npu_dynamic_mx_quant requires a 2D input [tokens, hidden_size].
+        # Diffusion transformer inputs are typically 3D [batch, seq, hidden] or
+        # higher. Flattening to 2D merges all leading dimensions into a single
+        # token axis so the NPU kernel can compute per-token MXFP8 scales, then
+        # we restore the original shape from the output.
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 

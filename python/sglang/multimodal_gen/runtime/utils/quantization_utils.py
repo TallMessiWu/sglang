@@ -19,7 +19,9 @@ def find_quant_modelslim_config(model_config, component_model_path):
     # Try exact name first, then glob for variant filenames (e.g. after repack)
     quant_config_file = Path(component_model_path, "quant_model_description.json")
     if not quant_config_file.is_file():
-        candidates = sorted(Path(component_model_path).glob("quant_model_description*.json"))
+        candidates = sorted(
+            Path(component_model_path).glob("quant_model_description*.json")
+        )
         quant_config_file = candidates[0] if candidates else None
 
     quant_cfg = None

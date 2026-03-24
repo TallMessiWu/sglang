@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch_npu
 from torch.nn.parameter import Parameter
 
 
@@ -20,8 +21,6 @@ class NPUMXFP8LinearMethod:
     def process_weights_after_loading(
         self, layer: torch.nn.Module, is_serialized: bool
     ):
-        import torch_npu
-
         if is_serialized:
             # Checkpoint already has fp8 weights + uint8 scales.
             # Ensure weight is float8_e4m3fn.
@@ -58,8 +57,6 @@ class NPUMXFP8LinearMethod:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import torch_npu
-
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
