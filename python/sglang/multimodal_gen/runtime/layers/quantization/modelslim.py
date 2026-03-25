@@ -124,9 +124,7 @@ class ModelSlimConfig(QuantizationConfig):
                 ModelSlimMXFP8Scheme,
             )
 
-            return ModelSlimMXFP8Scheme(
-                quant_config=self.quant_description, prefix=layer_name
-            )
+            return ModelSlimMXFP8Scheme()
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_scheme(

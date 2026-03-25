@@ -90,8 +90,8 @@ def get_quant_subpath(
     return quant_path
 
 
-def update_dict_(dict: Dict[str, Any], old_key: str, new_key: str) -> None:
-    dict[new_key] = dict.pop(old_key)
+def update_dict_(d: Dict[str, Any], old_key: str, new_key: str) -> None:
+    d[new_key] = d.pop(old_key)
 
 
 def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:

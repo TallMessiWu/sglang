@@ -4,7 +4,7 @@ Loads weights pre-quantized by msmodelslim (float8_e4m3fn weights,
 uint8 scales) and runs MXFP8 matmul at inference.
 """
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 import torch_npu
@@ -19,10 +19,6 @@ MXFP8_BLOCK_SIZE = 32
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
-
-    def __init__(self, quant_config: Dict[str, any], prefix: str):
-        self.quant_config = quant_config
-        self.prefix = prefix
 
     def create_weights(
         self,
@@ -49,7 +45,11 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        # msmodelslim exports weight_scale as uint8, shape [out, in/32]
+        # msmodelslim exports weight_scale as uint8, shape [out, in/32].
+        # NOTE: This parameter is intentionally named "weight_scale" (not
+        # "weight_scale_inv" as used in mxfp8_npu.py) because the weight loader
+        # matches parameter names to checkpoint keys, and msmodelslim checkpoints
+        # store this tensor under the key "<layer>.weight_scale".
         scale_dim = input_size_per_partition // MXFP8_BLOCK_SIZE
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
