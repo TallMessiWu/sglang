@@ -727,6 +727,14 @@ class ServerArgs:
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=None,
+            help='Quantization method override (e.g. "mxfp8", "fp8", "modelslim"). '
+            "When set, the transformer loader will use this instead of auto-detection.",
+        )
+
         # Nunchaku SVDQuant quantization parameters
         NunchakuSVDQuantArgs.add_cli_args(parser)
 
