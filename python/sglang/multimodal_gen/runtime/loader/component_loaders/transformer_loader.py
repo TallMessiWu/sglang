@@ -26,11 +26,13 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -81,9 +83,9 @@ class TransformerLoader(ComponentLoader):
         server_args: ServerArgs,
         safetensors_list: list[str],
         component_model_path: str,
-    ) -> Optional[dict]:
+    ) -> Optional[QuantizationConfig]:
         # priority: explicit --quantization flag → model config.json
-        #         → safetensors metadata → nunchaku config
+        #         → safetensors metadata → quantization config (nvfp4, nunchaku, ...)
         if server_args.quantization is not None:
             from sglang.multimodal_gen.runtime.layers.quantization import (
                 get_quantization_config,
@@ -100,7 +102,18 @@ class TransformerLoader(ComponentLoader):
                     safetensors_file
                 )
                 if quant_config:
-                    break
+                    return quant_config
+
+            # fallback: handle nvfp4 per-layer format metadata
+            # ({"format_version": ..., "layers": {"name": {"format": "nvfp4"}, ...}})
+            param_names_mapping_dict = (
+                server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+            )
+            quant_config = build_nvfp4_config_from_safetensors_list(
+                safetensors_list, param_names_mapping_dict
+            )
+            if quant_config:
+                return quant_config
         return quant_config
 
     def _resolve_target_param_dtype(
