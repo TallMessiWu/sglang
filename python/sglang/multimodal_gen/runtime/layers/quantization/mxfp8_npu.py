@@ -111,8 +111,17 @@ class NPUMXFP8DiffusionLinearMethod(LinearMethodBase):
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
 
-        # Ensure weight is on NPU before calling npu_dynamic_mx_quant
-        assert weight_fp.is_npu
+        # Move weight to NPU if needed. We intentionally use a conditional
+        # move rather than an assert because `dit_cpu_offload` defaults to
+        # True in ServerArgs, which causes fsdp_load to move every parameter
+        # back to CPU after loading (even when the target device is NPU).
+        # npu_dynamic_mx_quant requires an NPU tensor, so we must transfer
+        # here. The quantized fp8 weights produced below will remain on NPU
+        # for inference; if the model still needs to be offloaded after
+        # quantization (e.g. very large model on a small NPU), a higher-level
+        # offload pass can move them back afterwards.
+        if not weight_fp.is_npu:
+            weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
         # Online MXFP8 quantisation of weights (block_size=32)
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
