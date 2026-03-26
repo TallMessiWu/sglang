@@ -125,6 +125,12 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP8Scheme()
+        elif quant_type == "W4A4_MXFP4":
+            from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
+                ModelSlimMXFP4Scheme,
+            )
+
+            return ModelSlimMXFP4Scheme()
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_scheme(
