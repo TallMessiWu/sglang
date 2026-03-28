@@ -134,6 +134,16 @@ class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
         qw, w_dual_scale, w_scale = torch_npu.npu_dynamic_dual_level_mx_quant(
             weight_fp, smooth_scale=None
         )
+
+        # npu_dual_level_quant_matmul requires x2 (weight) in FRACTAL_NZ format.
+        # Reference: MindIE-SD W4A4MXFP4DualQuantLinear._init_dynamic_quant_param
+        qw = torch_npu.npu_format_cast(qw.view(torch.int8), 29)
+
+        # x2Level0Scale must be [in/level0_block_size, out] — transpose from
+        # the [out, in/level0_block_size] shape returned by the quant op.
+        # Reference: MindIE-SD layer.py:409
+        w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+
         layer.weight = Parameter(qw, requires_grad=False)
         layer.weight_dual_scale = Parameter(w_dual_scale, requires_grad=False)
         layer.weight_scale = Parameter(w_scale, requires_grad=False)
