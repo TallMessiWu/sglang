@@ -125,7 +125,7 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP8Scheme()
-        elif quant_type == "W4A4_MXFP4":
+        elif quant_type in ("W4A4_MXFP4", "W4A4_MXFP4_DUALSCALE"):
             from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
                 ModelSlimMXFP4Scheme,
             )
