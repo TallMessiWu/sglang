@@ -131,7 +131,10 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP4Scheme()
-        raise NotImplementedError("No modelslim compatible scheme was found.")
+        raise NotImplementedError(
+            f"No modelslim compatible scheme was found for layer '{layer_name}'. "
+            f"quant_description['{layer_name}.weight'] = '{quant_type}'"
+        )
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
