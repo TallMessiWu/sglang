@@ -71,9 +71,9 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
-        # L1 (coarse) dual scale: float32 [out, in/512, 1].
-        # Each L1 block covers 16 L0 blocks (512 elements).
-        dual_scale_dim = scale_dim // MXFP4_DUAL_LEVEL_RATIO
+        # L1 (coarse) scale for dual-level quantization matmul.
+        # Each L1 block covers MXFP4_DUAL_LEVEL_RATIO L0 blocks = 16 * 32 = 512 elements.
+        dual_scale_dim = scale_dim // MXFP4_DUAL_LEVEL_RATIO  # in/32 / 16 = in/512
         weight_dual_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 (output_size_per_partition, dual_scale_dim, 1),
@@ -91,6 +91,9 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
         weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
+        # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
+        # Reference: mxfp4_npu.py process_weights_after_loading
+        weight = torch_npu.npu_format_cast(weight.view(torch.int8), 29)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]
