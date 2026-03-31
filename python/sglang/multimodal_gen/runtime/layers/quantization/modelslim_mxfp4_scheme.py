@@ -1,8 +1,12 @@
 """ModelSlim MXFP4 scheme for pre-quantized weight inference on Ascend NPU.
 
-Loads weights pre-quantized by msmodelslim (float8_e4m3fn as FP4 packed
-container, uint8 scales, bfloat16 dual scales) and runs MXFP4 dual-level
+Loads weights pre-quantized by msmodelslim and runs MXFP4 dual-level
 matmul at inference via npu_dual_level_quant_matmul.
+
+Checkpoint tensor formats (verified from msmodelslim export):
+  weight:           [out, in]           float8_e4m3fn  (FP4 data in fp8 container)
+  weight_scale:     [out, in/32]        uint8          (L0 block scales, e8m0+127)
+  weight_dual_scale:[out, in/512, 1]    float32        (L1 coarse scales)
 
 Reference: MindIE-SD W4A4MXFP4DualQuantLinear
 (MindIE-SD/mindiesd/quantization/layer.py)
@@ -20,6 +24,9 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 MXFP4_BLOCK_SIZE = 32
+# L1 (dual) scale groups this many L0 blocks together.
+# L1 block covers 16 * 32 = 512 elements.
+MXFP4_DUAL_LEVEL_RATIO = 16
 
 
 class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
@@ -37,11 +44,12 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
 
-        # msmodelslim exports weight as float8_e4m3fn, shape [out, in/2].
-        # Two FP4 (E2M1) values are packed into one float8_e4m3fn byte.
+        # msmodelslim exports weight as float8_e4m3fn, shape [out, in].
+        # Each byte is a float8 container for FP4 data; the actual FP4 packing
+        # (npu_dtype_cast → float4_e2m1fn_x2) happens in process_weights_after_loading.
         weight = ModelWeightParameter(
             data=torch.empty(
-                (output_size_per_partition, input_size_per_partition // 2),
+                (output_size_per_partition, input_size_per_partition),
                 dtype=torch.float8_e4m3fn,
             ),
             input_dim=1,
@@ -50,8 +58,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        # msmodelslim exports weight_scale as uint8, shape [out, in/32].
-        # Stored as e8m0 scale + 127 offset.
+        # L0 block scale: uint8 [out, in/32], e8m0 scale with +127 offset.
         scale_dim = input_size_per_partition // MXFP4_BLOCK_SIZE
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
@@ -64,17 +71,13 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
-        # L1 (coarse) scale for dual-level quantization matmul.
-        # MindIE-SD loads this as [out, in/64, 1], then squeeze(-1) + transpose.
-        # The dual_scale groups every 2 L0 blocks (64 elements) into one L1 block.
-        # TODO: The exact shape and dtype depend on the checkpoint export tool.
-        # msmodelslim's current version may not export this field; ensure the
-        # checkpoint includes weight_dual_scale for dual-level matmul support.
-        dual_scale_dim = scale_dim // 2  # in/32 / 2 = in/64
+        # L1 (coarse) dual scale: float32 [out, in/512, 1].
+        # Each L1 block covers 16 L0 blocks (512 elements).
+        dual_scale_dim = scale_dim // MXFP4_DUAL_LEVEL_RATIO
         weight_dual_scale = GroupQuantScaleParameter(
             data=torch.empty(
-                (output_size_per_partition, dual_scale_dim),
-                dtype=torch.bfloat16,
+                (output_size_per_partition, dual_scale_dim, 1),
+                dtype=torch.float32,
             ),
             input_dim=1,
             output_dim=0,
@@ -96,11 +99,9 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
-        # Transform weight_dual_scale: [out, in/64] -> [in/64, out]
-        # MindIE-SD does squeeze(-1).transpose(0,1); we skip squeeze since
-        # our parameter is already 2D [out, in/64]
+        # Transform weight_dual_scale: [out, in/512, 1] -> [in/512, out]
         weight_dual_scale = layer.weight_dual_scale.data
-        weight_dual_scale = weight_dual_scale.transpose(0, 1).contiguous()
+        weight_dual_scale = weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
         layer.weight_dual_scale = torch.nn.Parameter(
             weight_dual_scale, requires_grad=False
         )
