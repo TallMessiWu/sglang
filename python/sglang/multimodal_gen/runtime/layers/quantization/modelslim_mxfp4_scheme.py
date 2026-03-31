@@ -93,7 +93,9 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
         # Reference: MindIE-SD W4A4MXFP4DualQuantLinear._init_dynamic_quant_param
-        weight = torch_npu.npu_format_cast(weight.view(torch.int8), 29, torch.int8)
+        weight = torch_npu.npu_format_cast(
+            weight.view(torch.int8), 29, customize_dtype=torch.int8
+        )
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]
