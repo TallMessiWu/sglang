@@ -274,8 +274,17 @@ def _resolve_quant_config(
 ) -> Optional[QuantizationConfig]:
     """
     resolve quant config from checkpoints' metadata
-    priority: model config.json -> safetensors metadata -> format-specific fallback
+    priority: explicit --quantization flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
+    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4, modelslim)
+    if server_args.quantization is not None:
+        from sglang.multimodal_gen.runtime.layers.quantization import (
+            get_quantization_config,
+        )
+
+        quant_cls = get_quantization_config(server_args.quantization)
+        return quant_cls.from_config({})
+
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
         for safetensors_file in safetensors_list:
