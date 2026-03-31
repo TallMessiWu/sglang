@@ -92,18 +92,24 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             weight = weight.to(f"npu:{torch.npu.current_device()}")
         weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
-        # Reference: mxfp4_npu.py process_weights_after_loading
-        weight = torch_npu.npu_format_cast(weight.view(torch.int8), 29)
+        # Reference: MindIE-SD W4A4MXFP4DualQuantLinear._init_dynamic_quant_param
+        weight = torch_npu.npu_format_cast(weight.view(torch.int8), 29, torch.int8)
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]
         # The dual-level matmul API expects L0 scales in this 3D format
         weight_scale = layer.weight_scale.data
+        if not weight_scale.is_npu:
+            weight_scale = weight_scale.to(f"npu:{torch.npu.current_device()}")
         weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
         # Transform weight_dual_scale: [out, in/512, 1] -> [in/512, out]
         weight_dual_scale = layer.weight_dual_scale.data
+        if not weight_dual_scale.is_npu:
+            weight_dual_scale = weight_dual_scale.to(
+                f"npu:{torch.npu.current_device()}"
+            )
         weight_dual_scale = weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
         layer.weight_dual_scale = torch.nn.Parameter(
             weight_dual_scale, requires_grad=False
