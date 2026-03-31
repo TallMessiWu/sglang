@@ -28,7 +28,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, ini
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
-    get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -90,6 +89,15 @@ class TransformerLoader(ComponentLoader):
             from sglang.multimodal_gen.runtime.layers.quantization import (
                 get_quantization_config,
             )
+
+            # modelslim requires a per-layer quant description file; load it from
+            # the component directory rather than returning an empty config.
+            if server_args.quantization == "modelslim":
+                from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+                    get_quant_config,
+                )
+
+                return get_quant_config(hf_config, component_model_path)
 
             quant_cls = get_quantization_config(server_args.quantization)
             return quant_cls.from_config({})
