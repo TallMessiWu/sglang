@@ -86,33 +86,79 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         layer.register_parameter("weight_dual_scale", weight_dual_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        import logging
+
+        _log = logging.getLogger(__name__)
+
         # Cast weight from fp8 container to FP4 packed format
         weight = layer.weight.data
+        _log.warning(
+            "[MXFP4-DBG] weight BEFORE cast: shape=%s dtype=%s device=%s",
+            weight.shape,
+            weight.dtype,
+            weight.device,
+        )
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
         weight = torch_npu.npu_dtype_cast(weight, torch_npu.float4_e2m1fn_x2)
+        _log.warning(
+            "[MXFP4-DBG] weight AFTER npu_dtype_cast: shape=%s dtype=%s",
+            weight.shape,
+            weight.dtype,
+        )
+        weight_int8_view = weight.view(torch.int8)
+        _log.warning(
+            "[MXFP4-DBG] weight.view(int8): shape=%s dtype=%s",
+            weight_int8_view.shape,
+            weight_int8_view.dtype,
+        )
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format 29).
         # Reference: MindIE-SD W4A4MXFP4DualQuantLinear._init_dynamic_quant_param
         weight = torch_npu.npu_format_cast(
-            weight.view(torch.int8), 29, customize_dtype=torch.int8
+            weight_int8_view, 29, customize_dtype=torch.int8
+        )
+        _log.warning(
+            "[MXFP4-DBG] weight AFTER format_cast(NZ): shape=%s dtype=%s",
+            weight.shape,
+            weight.dtype,
         )
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]
         # The dual-level matmul API expects L0 scales in this 3D format
         weight_scale = layer.weight_scale.data
+        _log.warning(
+            "[MXFP4-DBG] weight_scale BEFORE reshape: shape=%s dtype=%s",
+            weight_scale.shape,
+            weight_scale.dtype,
+        )
         if not weight_scale.is_npu:
             weight_scale = weight_scale.to(f"npu:{torch.npu.current_device()}")
         weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
+        _log.warning(
+            "[MXFP4-DBG] weight_scale AFTER reshape: shape=%s dtype=%s",
+            weight_scale.shape,
+            weight_scale.dtype,
+        )
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
         # Transform weight_dual_scale: [out, in/512, 1] -> [in/512, out]
         weight_dual_scale = layer.weight_dual_scale.data
+        _log.warning(
+            "[MXFP4-DBG] weight_dual_scale BEFORE transform: shape=%s dtype=%s",
+            weight_dual_scale.shape,
+            weight_dual_scale.dtype,
+        )
         if not weight_dual_scale.is_npu:
             weight_dual_scale = weight_dual_scale.to(
                 f"npu:{torch.npu.current_device()}"
             )
         weight_dual_scale = weight_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+        _log.warning(
+            "[MXFP4-DBG] weight_dual_scale AFTER transform: shape=%s dtype=%s",
+            weight_dual_scale.shape,
+            weight_dual_scale.dtype,
+        )
         layer.weight_dual_scale = torch.nn.Parameter(
             weight_dual_scale, requires_grad=False
         )
