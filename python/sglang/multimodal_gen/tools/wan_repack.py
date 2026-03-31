@@ -55,6 +55,9 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     # MXFP4 msmodelslim wraps Linear layers with a `.linear.` subpath;
     # strip it so keys match the SGLang model parameters.
     ".linear.": ".",
+    # NonFusionSmoothQuantWrapper exports smooth quant scale as `.div.mul_scale`;
+    # strip `.div.` so it loads as a direct parameter `mul_scale` on the linear layer.
+    ".div.": ".",
 }
 
 SUPPORTED_MODEL_TYPES = ["Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B", "Wan2.2-TI2V-5B"]
