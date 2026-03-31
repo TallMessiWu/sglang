@@ -276,7 +276,7 @@ def _resolve_quant_config(
     resolve quant config from checkpoints' metadata
     priority: explicit --quantization flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
-    # Explicit --quantization flag takes highest priority
+    # priority: explicit --quantization flag (e.g. mxfp8, mxfp4, modelslim)
     if server_args.quantization is not None:
         from sglang.multimodal_gen.runtime.layers.quantization import (
             get_quantization_config,
