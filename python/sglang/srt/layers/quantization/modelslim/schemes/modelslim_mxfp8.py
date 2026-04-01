@@ -13,6 +13,7 @@ from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightPar
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 MXFP8_BLOCK_SIZE = 32
+_FLOAT8_E8M0FNU_DTYPE = getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
@@ -60,13 +61,14 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         # weight is already float8_e4m3fn, no cast needed
         weight = layer.weight.data
-        layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+        # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
+        layer.weight = torch.nn.Parameter(weight.transpose(0, 1).contiguous(), requires_grad=False)
 
         # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]
-        # npu_quant_matmul expects the scale in paired-element format
+        # then transpose to [in/64, out, 2] for npu_quant_matmul
         weight_scale = layer.weight_scale.data
         weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
-        layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(weight_scale.transpose(0, 1).contiguous(), requires_grad=False)
 
     def apply_weights(
         self,
@@ -88,14 +90,14 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
             x_2d, dst_type=torch_npu.float8_e4m3fn
         )
 
-        # MXFP8 matmul
+        # MXFP8 matmul (weight & scale already transposed at load time)
         output = torch_npu.npu_quant_matmul(
             qx,
-            layer.weight.transpose(0, 1),
-            layer.weight_scale.transpose(0, 1),
-            scale_dtype=torch_npu.float8_e8m0fnu,
+            layer.weight,
+            layer.weight_scale,
+            scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             pertoken_scale=input_scale,
-            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             bias=bias.to(torch.float32) if bias is not None else None,
             output_dtype=original_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],

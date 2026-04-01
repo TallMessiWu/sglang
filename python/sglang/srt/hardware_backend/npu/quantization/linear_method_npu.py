@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 MXFP8_BLOCK_SIZE = 32
+_FLOAT8_E8M0FNU_DTYPE = getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -168,8 +169,9 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
             weight_fp, dst_type=torch_npu.float8_e4m3fn
         )
-        layer.weight = Parameter(qw, requires_grad=False)
-        layer.weight_scale_inv = Parameter(w_scale, requires_grad=False)
+        # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
+        layer.weight = Parameter(qw.transpose(0, 1).contiguous(), requires_grad=False)
+        layer.weight_scale_inv = Parameter(w_scale.transpose(0, 1).contiguous(), requires_grad=False)
 
     def apply(
         self,
@@ -191,14 +193,14 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch_npu.float8_e4m3fn
         )
 
-        # MXFP8 matmul
+        # MXFP8 matmul (weight & scale already transposed at load time)
         output = torch_npu.npu_quant_matmul(
             qx,
-            layer.weight.transpose(0, 1),
-            layer.weight_scale_inv.transpose(0, 1),
-            scale_dtype=torch_npu.float8_e8m0fnu,
+            layer.weight,
+            layer.weight_scale_inv,
+            scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             pertoken_scale=input_scale,
-            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             bias=bias.to(torch.float32) if bias is not None else None,
             output_dtype=original_dtype,
             group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
