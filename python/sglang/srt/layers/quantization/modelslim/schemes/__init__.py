@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from .modelslim_mxfp8 import ModelSlimMXFP8Scheme
 from .modelslim_scheme import ModelSlimLinearScheme, ModelSlimMoEScheme
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
 from .modelslim_w4a4_int4_moe import ModelSlimW4A4Int4MoE
@@ -10,6 +11,7 @@ from .modelslim_w8a8_int8_moe import ModelSlimW8A8Int8MoE
 __all__ = [
     "ModelSlimLinearScheme",
     "ModelSlimMoEScheme",
+    "ModelSlimMXFP8Scheme",
     "ModelSlimW8A8Int8",
     "ModelSlimW4A4Int4",
     "ModelSlimW4A4Int4MoE",

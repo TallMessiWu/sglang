@@ -169,6 +169,8 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if is_npu():
+            return 0  # NPU bypasses CUDA capability checks
         return 100 if self.use_mxfp8 else 80
 
     @classmethod
@@ -222,6 +224,12 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
+            if is_npu() and self.use_mxfp8:
+                from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                    NPUMXFP8LinearMethod,
+                )
+
+                return NPUMXFP8LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
