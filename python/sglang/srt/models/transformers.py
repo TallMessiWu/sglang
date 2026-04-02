@@ -99,6 +99,7 @@ def replace_linear_class(
     linear: nn.Linear,
     style: Literal["colwise", "rowwise"],
     quant_config: QuantizationConfig,
+    prefix: str = "",
 ) -> Union[ColumnParallelLinear, RowParallelLinear]:
     """
     Replace nn.Linear with one of vLLM's tensor parallel linear classes.
@@ -107,6 +108,7 @@ def replace_linear_class(
         linear (nn.Linear): `nn.Linear` to be replaced.
         style (str): Tensor parallel style of the new linear, e.g. "colwise".
         quant_config (QuantConfig): Quantization config for the new linear.
+        prefix (str): Layer name prefix used for per-layer quantization dispatch.
     Returns:
         Union[ColumnParallelLinear, RowParallelLinear]: The new linear.
     """
@@ -136,6 +138,7 @@ def replace_linear_class(
         output_size=linear.out_features,
         bias=linear.bias is not None,
         quant_config=quant_config,
+        prefix=prefix,
     )
 
 
@@ -227,14 +230,14 @@ class TransformersForCausalLM(nn.Module):
                         child_module, nn.Linear
                     ):
                         new_module = replace_linear_class(
-                            child_module, style, self.quant_config
+                            child_module, style, self.quant_config, prefix=qual_name
                         )
                         setattr(module, child_name, new_module)
                         self.log_replacement(qual_name, child_module, new_module)
                 else:
                     _tensor_parallel(child_module, prefix=qual_name)
 
-        _tensor_parallel(self.model)
+        _tensor_parallel(self.model, prefix="model")
 
     def replace_vocab_embed_class(self, module: nn.Module):
         # Use native set input embeddings
