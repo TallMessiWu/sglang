@@ -13,7 +13,9 @@ from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightPar
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 MXFP8_BLOCK_SIZE = 32
-_FLOAT8_E8M0FNU_DTYPE = getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+_FLOAT8_E8M0FNU_DTYPE = getattr(
+    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+)
 
 
 class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
@@ -60,15 +62,15 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         # weight is already float8_e4m3fn, no cast needed
-        weight = layer.weight.data
         # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
-        layer.weight = torch.nn.Parameter(weight.transpose(0, 1).contiguous(), requires_grad=False)
-
-        # Reshape weight_scale: [out, in/32] -> [out, in/64, 2]
-        # then transpose to [in/64, out, 2] for npu_quant_matmul
-        weight_scale = layer.weight_scale.data
-        weight_scale = weight_scale.reshape(weight_scale.shape[0], -1, 2)
-        layer.weight_scale = torch.nn.Parameter(weight_scale.transpose(0, 1).contiguous(), requires_grad=False)
+        # NOTE: Use .data in-place (no .contiguous()) to preserve the transpose view.
+        # npu_quant_matmul reads strides to understand the memory layout; calling
+        # .contiguous() would physically reorder data and break the block-scale
+        # mapping, producing garbled output.
+        n_dim, k_dim = layer.weight_scale.data.shape
+        layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+        layer.weight.data = layer.weight.data.transpose(0, 1)
+        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
 
     def apply_weights(
         self,
