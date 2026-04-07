@@ -61,12 +61,10 @@ class ModelSlimMXFP8Scheme(ModelSlimLinearScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # weight is already float8_e4m3fn, no cast needed
-        # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
-        # NOTE: Use .data in-place (no .contiguous()) to preserve the transpose view.
-        # npu_quant_matmul reads strides to understand the memory layout; calling
-        # .contiguous() would physically reorder data and break the block-scale
-        # mapping, producing garbled output.
+        # Pre-transpose weight and scale to [in, out] for npu_quant_matmul.
+        # Use .data assignment without .contiguous() to preserve the transpose
+        # view strides — npu_quant_matmul reads strides correctly and calling
+        # .contiguous() would reorder data, breaking the block-scale mapping.
         n_dim, k_dim = layer.weight_scale.data.shape
         layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight.data = layer.weight.data.transpose(0, 1)
