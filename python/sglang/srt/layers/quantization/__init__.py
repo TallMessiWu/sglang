@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.npu_mxfp4 import NPUMxfp4Config
+from sglang.srt.layers.quantization.npu_mxfp4_w4a4 import NPUMxfp4W4A4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
@@ -79,6 +80,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
     "mxfp4_npu": NPUMxfp4Config,
+    "mxfp4w4a4_npu": NPUMxfp4W4A4Config,
 }
 
 
