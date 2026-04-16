@@ -270,6 +270,24 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import logging
+
+        from sglang.srt.utils import get_npu_memory_capacity
+
+        _logger = logging.getLogger(__name__)
+
+        # Heuristic hardware check: npu_dynamic_dual_level_mx_quant requires Ascend 950.
+        # Atlas A2/A3 have ≤64 GB per card; Ascend 950 has ≥96 GB per card.
+        npu_mem_mb = get_npu_memory_capacity()
+        if npu_mem_mb < 96 * 1024:
+            _logger.warning(
+                "MXFP4 W4A8 dual-level quantization may not be supported on this "
+                "hardware (detected NPU memory %.1f GB < 96 GB). "
+                "npu_dynamic_dual_level_mx_quant requires Ascend 950 (Atlas A3). "
+                "Continuing — expect a RuntimeError if the kernel is unavailable.",
+                npu_mem_mb / 1024,
+            )
+
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
@@ -282,9 +300,17 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         # qw:          float4_e2m1fn_x2, shape [out, in]
         # w_dual_scale: float32,          shape [out, in/512, 1]  (L0)
         # w_scale:      float8_e8m0,      shape [out, (ceil(in/32)+1)//2, 2]  (L1)
-        qw, w_dual_scale, w_scale = torch_npu.npu_dynamic_dual_level_mx_quant(
-            weight_fp, smooth_scale=None
-        )
+        try:
+            qw, w_dual_scale, w_scale = torch_npu.npu_dynamic_dual_level_mx_quant(
+                weight_fp, smooth_scale=None
+            )
+        except (RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                "npu_dynamic_dual_level_mx_quant failed — this operation requires "
+                "Ascend 950 (Atlas A3). Atlas 800I A2/A3 and earlier chips do NOT "
+                "support DualLevelQuantBatchMatmul. "
+                f"Original error: {e}"
+            ) from e
 
         # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format=29)
         # view as int8 first because npu_format_cast only accepts int-dtype tensors
@@ -333,6 +359,120 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         # Restore original shape (replace last dim with output features)
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+
+class NPUW4A8DynamicLinearMethod(_NPULinearMethodBase):
+    """Ascend NPU W4A8 offline quantization linear method.
+
+    Offline mode: loads ModelSlim pre-quantized INT4 weights.
+    For ``new_quant_version=True`` (version "1.0.0"): 2 int4 values are pre-packed
+    into 1 int8 in the checkpoint (shape ``[N/2, K]``).
+    For old version: plain int4 stored as int8 (shape ``[N, K]``).
+
+    Uses ``torch_npu.npu_weight_quant_batchmatmul`` for inference — activations
+    stay in high precision and INT4 weights are dequantized on-the-fly.
+    """
+
+    def __init__(
+        self,
+        group_size: int = 256,
+        new_quant_version: bool = True,
+    ):
+        super().__init__()
+        self.group_size = group_size
+        self.new_quant_version = new_quant_version
+
+    @staticmethod
+    def _process_scale_second(
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        per_group_scale: torch.Tensor,
+        is_new_quant: bool = False,
+    ):
+        """Merge per-channel (L1) and per-group (L2) scales into antiquant_scale.
+
+        Args:
+            weight: weight after transpose, shape ``[K, N/2]`` (new) or ``[K, N]`` (old)
+            scale: per-channel L1 scale, shape ``[N]``
+            per_group_scale: per-group L2 scale after transpose, shape ``[K//group_size, N]``
+            is_new_quant: whether weight dim is compressed (N/2)
+
+        Returns:
+            (antiquant_scale, bias): ``antiquant_scale`` shape ``[K//group_size, N]``;
+            ``bias`` is non-None only for old version (asymmetric compensation term).
+        """
+        k, n_compressed = weight.shape
+        group_num, n_scale = per_group_scale.shape
+
+        # Logical N dimension
+        n = n_compressed * 2 if is_new_quant else n_compressed
+
+        bias = None
+        if not is_new_quant:
+            weight_high = weight.to(torch.float32).reshape(
+                group_num, -1, n
+            ) * per_group_scale.reshape(group_num, 1, n)
+            weight_high = weight_high.reshape(k, n)
+            bias = 8 * (weight_high.to(torch.float32) * scale).sum(dim=0)
+
+        antiquant_scale = (scale * per_group_scale).reshape(group_num, n)
+        return antiquant_scale, bias
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+        # Transpose [N, K] → [K, N] (or [N/2, K] → [K, N/2] for packed)
+        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        # Cast to FRACTAL_NZ format for NPU matmul efficiency
+        layer.weight.data = npu_format_cast(layer.weight.data)
+
+        # Flatten per-channel scales to 1-D float32
+        layer.weight_scale.data = layer.weight_scale.data.flatten().to(torch.float32)
+        layer.weight_offset.data = layer.weight_offset.data.flatten()
+
+        # Merge L1/L2 scales: weight_scale_second loaded as [N, K//group_size],
+        # transpose to [K//group_size, N] for process_scale_second
+        layer.weight_scale_second.data, scale_bias = self._process_scale_second(
+            layer.weight.data,
+            layer.weight_scale.data,
+            layer.weight_scale_second.data.transpose(0, 1).contiguous(),
+            is_new_quant=self.new_quant_version,
+        )
+
+        if self.new_quant_version:
+            # Handle optional scale_bias parameter
+            if hasattr(layer, "scale_bias"):
+                if layer.scale_bias.data.shape[1] == 1:
+                    layer.scale_bias.data = layer.scale_bias.data.flatten()
+                else:
+                    layer.scale_bias.data = layer.scale_bias.data.contiguous()
+            # Pack 4 int8 (2×int4) into int32 for NPU kernel
+            assert (
+                layer.weight.data.shape[-1] % 4 == 0
+            ), f"Last dim of weight must be divisible by 4, got {layer.weight.data.shape}"
+            layer.weight.data = layer.weight.data.view(torch.int32).contiguous()
+        else:
+            # Old version: use NPU int4-pack conversion
+            if scale_bias is not None:
+                param = torch.nn.Parameter(scale_bias, requires_grad=False)
+                layer.register_parameter("weight_scale_bias", param)
+            layer.weight.data = torch_npu.npu_convert_weight_to_int4pack(
+                layer.weight.data.to(torch.int32)
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Weight-dequant path: INT4 weights dequantized on-the-fly, activations in high precision
+        return torch_npu.npu_weight_quant_batchmatmul(
+            x,
+            layer.weight,
+            antiquant_scale=layer.weight_scale_second.to(x.dtype),
+            antiquant_group_size=self.group_size,
+        )
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):

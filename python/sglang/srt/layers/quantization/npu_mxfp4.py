@@ -13,6 +13,7 @@ on Atlas A2/A3 – check your hardware before enabling).
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
@@ -29,6 +30,8 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 class NPUMxfp4Config(QuantizationConfig):
@@ -104,6 +107,12 @@ class NPUMxfp4Config(QuantizationConfig):
             return NPUMXFP4W4A8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             # MoE MXFP4 not yet implemented; fall back to unquantised
+            logger.warning(
+                "MXFP4 W4A8 quantization is not yet supported for FusedMoE layers "
+                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
+                "run in full precision (BF16/FP16).",
+                prefix,
+            )
             return UnquantizedFusedMoEMethod(
                 layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
             )
