@@ -15,6 +15,7 @@ Hardware requirement: verify float4_e2m1fn support on target Ascend hardware.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
@@ -31,6 +32,8 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 class NPUMxfp4W4A4Config(QuantizationConfig):
@@ -106,7 +109,13 @@ class NPUMxfp4W4A4Config(QuantizationConfig):
 
             return NPUSingleLevelMXFP4LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            # MoE MXFP4 W4A4 not yet implemented; fall back to unquantised
+            # MoE single-level MXFP4 W4A4 not yet implemented; fall back to unquantised
+            logger.warning(
+                "MXFP4 W4A4 quantization is not yet supported for FusedMoE layers "
+                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
+                "run in full precision (BF16/FP16).",
+                prefix,
+            )
             return UnquantizedFusedMoEMethod(
                 layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
             )
