@@ -201,12 +201,12 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP8Scheme()
-        elif quant_type == "W4A8_MXFP":
-            from sglang.srt.layers.quantization.modelslim.schemes.modelslim_mxfp8 import (
-                ModelSlimMXFP8Scheme,
+        elif quant_type == "W4A4_MXFP4":
+            from sglang.srt.layers.quantization.modelslim.schemes.modelslim_mxfp4 import (
+                ModelSlimMXFP4Scheme,
             )
 
-            return ModelSlimMXFP8Scheme()
+            return ModelSlimMXFP4Scheme()
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_linear_scheme(
