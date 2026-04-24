@@ -1,6 +1,6 @@
 """Ascend NPU MXFP4 W4A4 online quantization config.
 
-Triggered by ``--quantization mxfp4w4a4_npu``.
+Triggered by ``--quantization mxfp4_w4a4_npu``.
 
 Online mode: loads FP16/BF16 weights, quantises to single-level MXFP4 in
 ``process_weights_after_loading``.  During inference, activations are
@@ -56,7 +56,7 @@ class NPUMxfp4W4A4Config(QuantizationConfig):
 
     @classmethod
     def get_name(cls) -> str:
-        return "mxfp4w4a4_npu"
+        return "mxfp4_w4a4_npu"
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
