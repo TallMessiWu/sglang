@@ -492,7 +492,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         → BF16/FP16 output
 
     Analogous to NPUMXFP8LinearMethod but with FP4 dtype instead of FP8.
-    Triggered by ``--quantization mxfp4w4a4_npu``.
+    Triggered by ``--quantization mxfp4_w4a4_npu``.
     """
 
     _FLOAT4_E2M1FN_DTYPE = getattr(

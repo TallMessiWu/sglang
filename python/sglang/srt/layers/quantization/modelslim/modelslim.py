@@ -201,6 +201,12 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP8Scheme()
+        elif quant_type == "W4A8_MXFP":
+            from sglang.srt.layers.quantization.modelslim.schemes.modelslim_mxfp4_w4a8 import (
+                ModelSlimMXFP4W4A8Scheme,
+            )
+
+            return ModelSlimMXFP4W4A8Scheme()
         elif quant_type == "W4A4_MXFP4":
             from sglang.srt.layers.quantization.modelslim.schemes.modelslim_mxfp4 import (
                 ModelSlimMXFP4Scheme,

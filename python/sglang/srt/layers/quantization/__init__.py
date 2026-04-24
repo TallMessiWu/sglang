@@ -79,8 +79,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
-    "mxfp4_npu": NPUMxfp4Config,
-    "mxfp4w4a4_npu": NPUMxfp4W4A4Config,
+    "mxfp4_w4a8_npu": NPUMxfp4Config,
+    "mxfp4_w4a4_npu": NPUMxfp4W4A4Config,
 }
 
 
