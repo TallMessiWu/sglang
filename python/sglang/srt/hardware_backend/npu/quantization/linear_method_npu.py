@@ -482,21 +482,22 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
     """Ascend NPU W4A4 online quantization: single-level MXFP4.
 
     Weight flow (process_weights_after_loading):
-        BF16/FP16 weight → npu_dynamic_mx_quant(dst_type=float4_e2m1fn)
-        → (qw: float4, w_scale: FP8_E8M0)
-        → transpose to [in, out] for npu_quant_matmul
+        BF16/FP16 weight → npu_dynamic_mx_quant(dst_type=float4_e2m1fn_x2)
+        → (qw: packed uint8 [out, in//2], w_scale: FP8_E8M0)
+        → transpose to [in//2, out] for npu_quant_matmul
 
     Inference flow (apply):
-        BF16/FP16 activation → npu_dynamic_mx_quant(dst_type=float4_e2m1fn)
-        → npu_quant_matmul(..., group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
+        BF16/FP16 activation → npu_dynamic_mx_quant(dst_type=float4_e2m1fn_x2)
+        → npu_quant_matmul(..., x1_dtype/x2_dtype=float4_e2m1fn_x2,
+                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
         → BF16/FP16 output
 
     Analogous to NPUMXFP8LinearMethod but with FP4 dtype instead of FP8.
     Triggered by ``--quantization mxfp4_w4a4_npu``.
     """
 
-    _FLOAT4_E2M1FN_DTYPE = getattr(
-        torch_npu, "float4_e2m1fn", getattr(torch, "float4_e2m1fn", None)
+    _FLOAT4_E2M1FN_X2_DTYPE = getattr(
+        torch_npu, "float4_e2m1fn_x2", getattr(torch, "float4_e2m1fn_x2", None)
     )
 
     def create_weights(
@@ -541,15 +542,16 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
-        # Online single-level MXFP4 quantisation of weights (block_size=32)
+        # Online single-level MXFP4 quantisation: output qw is packed uint8 [out, in//2]
         qw, w_scale = torch_npu.npu_dynamic_mx_quant(
-            weight_fp, dst_type=self._FLOAT4_E2M1FN_DTYPE
+            weight_fp, dst_type=self._FLOAT4_E2M1FN_X2_DTYPE, round_mode="round"
         )
-        # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
-        layer.weight = Parameter(qw.transpose(0, 1).contiguous(), requires_grad=False)
-        layer.weight_scale_inv = Parameter(
-            w_scale.transpose(0, 1).contiguous(), requires_grad=False
-        )
+        # Pre-transpose to [in//2, out] for npu_quant_matmul; use .data= to preserve
+        # non-contiguous strides so block-scale mapping stays intact (no .contiguous()).
+        layer.weight = Parameter(qw, requires_grad=False)
+        layer.weight.data = layer.weight.data.transpose(0, 1)
+        layer.weight_scale_inv = Parameter(w_scale, requires_grad=False)
+        layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(0, 1)
 
     def apply(
         self,
@@ -568,7 +570,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
         # Dynamic single-level MXFP4 activation quantisation
         qx, input_scale = torch_npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=self._FLOAT4_E2M1FN_DTYPE
+            x_2d, dst_type=self._FLOAT4_E2M1FN_X2_DTYPE, round_mode="round"
         )
 
         # MXFP4 matmul (weight & scale already transposed at load time)
@@ -581,6 +583,8 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
             pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             bias=bias.to(torch.float32) if bias is not None else None,
             output_dtype=original_dtype,
+            x1_dtype=self._FLOAT4_E2M1FN_X2_DTYPE,
+            x2_dtype=self._FLOAT4_E2M1FN_X2_DTYPE,
             group_sizes=[1, 1, MXFP4_BLOCK_SIZE],
         )
 
