@@ -100,9 +100,12 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight_scale = layer.weight_scale.data
         if not weight_scale.is_npu:
             weight_scale = weight_scale.to(f"npu:{torch.npu.current_device()}")
-        # Transpose weight_scale [out, in/32] -> [in/32, out].
-        # Avoid .contiguous() to keep block-scale mapping intact.
-        layer.weight_scale.data = weight_scale.transpose(0, 1)
+        # npu_quant_matmul with float4_e2m1fn_x2 requires x2Scale to be 3D.
+        # Reshape [out, in/32] -> [out, in/64, 2], then transpose to [in/64, out, 2].
+        n_dim, k_dim = weight_scale.shape
+        layer.weight_scale.data = weight_scale.reshape(n_dim, k_dim // 2, 2).transpose(
+            0, 1
+        )
 
     def apply_weights(
         self,
