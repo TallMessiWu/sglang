@@ -30,9 +30,8 @@ from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearSche
 
 MXFP4_BLOCK_SIZE = 32
 
-_FLOAT4_E2M1FN_X2_DTYPE = getattr(torch_npu, "float4_e2m1fn_x2", None)
-_FLOAT4_E2M1FN_DTYPE = getattr(
-    torch_npu, "float4_e2m1fn", getattr(torch, "float4_e2m1fn", None)
+_FLOAT4_E2M1FN_X2_DTYPE = getattr(
+    torch_npu, "float4_e2m1fn_x2", getattr(torch, "float4_e2m1fn_x2", None)
 )
 _FLOAT8_E8M0FNU_DTYPE = getattr(
     torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
@@ -122,7 +121,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
         # Dynamic single-level MXFP4 activation quantization
         qx, input_scale = torch_npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=_FLOAT4_E2M1FN_DTYPE
+            x_2d, dst_type=_FLOAT4_E2M1FN_X2_DTYPE, round_mode="round"
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load time)
@@ -135,6 +134,8 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
             bias=bias.to(torch.float32) if bias is not None else None,
             output_dtype=original_dtype,
+            x1_dtype=_FLOAT4_E2M1FN_X2_DTYPE,
+            x2_dtype=_FLOAT4_E2M1FN_X2_DTYPE,
             group_sizes=[1, 1, MXFP4_BLOCK_SIZE],
         )
 
