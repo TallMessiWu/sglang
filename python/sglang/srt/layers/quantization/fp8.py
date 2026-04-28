@@ -238,6 +238,12 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
+            if is_npu() and self.use_mxfp8:
+                from sglang.srt.hardware_backend.npu.quantization.moe_method_npu import (
+                    NPUMXFP8FusedMoEMethod,
+                )
+
+                return NPUMXFP8FusedMoEMethod(self)
             return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)

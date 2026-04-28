@@ -1032,3 +1032,115 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             )
 
         return out_hidden
+
+
+MXFP8_BLOCK_SIZE = 32
+_FLOAT8_E8M0FNU_DTYPE = getattr(__import__("torch_npu"), "float8_e8m0fnu", None)
+
+
+def npu_fused_experts_mxfp8(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """MXFP8 W8A8 fused MoE experts forward for Ascend NPU.
+
+    Args:
+        hidden_states: BF16/FP16 activations, shape [tokens, H] or [B, S, H].
+        w13: float8_e4m3fn gate+up weights, shape [E, H, 2*I]
+             (transposed from [E, 2*I, H] in process_weights_after_loading).
+        w13_scale: uint8 (UE8M0) weight scales, shape [E, H//32, 2*I].
+        w2: float8_e4m3fn down weights, shape [E, I, H]
+            (transposed from [E, H, I]).
+        w2_scale: uint8 (UE8M0) weight scales, shape [E, I//32, H].
+        topk_weights: router weights, shape [tokens, top_k].
+        topk_ids: expert indices, shape [tokens, top_k] int32.
+        top_k: number of experts selected per token.
+    """
+    import torch_npu
+
+    original_shape = hidden_states.shape
+    original_dtype = hidden_states.dtype
+    if original_dtype not in (torch.float16, torch.bfloat16):
+        hidden_states = hidden_states.to(torch.bfloat16)
+        original_dtype = torch.bfloat16
+
+    if len(original_shape) == 3:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+    num_tokens = hidden_states.shape[0]
+    num_experts = w13.shape[0]
+
+    hidden_states, expanded_row_idx, expert_tokens, _ = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode=-1,
+        )
+    )
+    expert_tokens = expert_tokens.to(torch.int64)
+
+    # gmm1: gate_up_proj — dynamic MXFP8 activation quant
+    qx, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+        hidden_states, dst_type=torch_npu.float8_e4m3fn
+    )
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[qx],
+        weight=[w13],
+        scale=[w13_scale],
+        per_token_scale=[pertoken_scale],
+        scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        per_token_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    # act_fn: swiglu
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+
+    # gmm2: down_proj — dynamic MXFP8 activation quant
+    qx2, pertoken_scale2 = torch_npu.npu_dynamic_mx_quant(
+        hidden_states, dst_type=torch_npu.float8_e4m3fn
+    )
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[qx2],
+        weight=[w2],
+        scale=[w2_scale],
+        per_token_scale=[pertoken_scale2],
+        scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        per_token_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+        drop_pad_mode=2,
+    )
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+    return final_hidden_states
