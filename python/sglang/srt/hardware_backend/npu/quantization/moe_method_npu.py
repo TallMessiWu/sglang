@@ -7,7 +7,6 @@ from torch.nn.parameter import Parameter
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     npu_fused_experts_mxfp8,
 )
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
 
@@ -86,8 +85,9 @@ class NPUMXFP8FusedMoEMethod(FusedMoEMethodBase):
                 w_e = w_e.to(device)
             qw_e, s_e = torch_npu.npu_dynamic_mx_quant(
                 w_e, dst_type=torch_npu.float8_e4m3fn
-            )  # qw_e: [2I, H], s_e: [2I, H//32]
-            qw13_list.append(qw_e)
+            )  # qw_e: [2I, H] float8, s_e: [2I, H//32] uint8
+            # torch.stack doesn't support float8_e4m3fn on NPU; view as uint8 (same byte width) for stacking
+            qw13_list.append(qw_e.view(torch.uint8))
             s13_list.append(s_e)
 
         qw2_list, s2_list = [], []
@@ -99,32 +99,31 @@ class NPUMXFP8FusedMoEMethod(FusedMoEMethodBase):
                 w_e = w_e.to(device)
             qw_e, s_e = torch_npu.npu_dynamic_mx_quant(
                 w_e, dst_type=torch_npu.float8_e4m3fn
-            )  # qw_e: [H, I], s_e: [H, I//32]
-            qw2_list.append(qw_e)
+            )  # qw_e: [H, I] float8, s_e: [H, I//32] uint8
+            qw2_list.append(qw_e.view(torch.uint8))
             s2_list.append(s_e)
 
-        qw13 = torch.stack(qw13_list)  # [E, 2I, H]
-        s13 = torch.stack(s13_list)  # [E, 2I, H//32]
-        qw2 = torch.stack(qw2_list)  # [E, H, I]
-        s2 = torch.stack(s2_list)  # [E, H, I//32]
+        # Stack as uint8 (float8_e4m3fn unsupported by NPU torch.stack), then view back to float8
+        qw13 = torch.stack(qw13_list).view(torch.float8_e4m3fn)  # [E, 2I, H]
+        s13 = torch.stack(s13_list)  # [E, 2I, H//32] uint8
+        qw2 = torch.stack(qw2_list).view(torch.float8_e4m3fn)  # [E, H, I]
+        s2 = torch.stack(s2_list)  # [E, H, I//32] uint8
 
-        # Transpose for npu_grouped_matmul: [E, N, K] → [E, K, N] so K (hidden/intermediate) is dim-1.
-        # npu_format_cast converts weight to NZ NPU format (same as INT8 MoE path).
-        # Scale: transpose(1,2) only — no .contiguous() to preserve non-contiguous strides
-        # that align with block-scale memory layout (matches CLAUDE.md "已知陷阱").
+        # Transpose for npu_grouped_matmul: [E, N, K] → [E, K, N] so K is dim-1.
+        # No npu_format_cast — MXFP8 grouped_matmul does not require NZ format (unlike INT8 path).
         layer.w13_weight = Parameter(
-            npu_format_cast(qw13.transpose(1, 2)), requires_grad=False
-        )  # [E, H, 2I]
+            qw13.transpose(1, 2), requires_grad=False
+        )  # [E, H, 2I] float8_e4m3fn
         layer.w13_weight_scale = Parameter(
             s13.transpose(1, 2), requires_grad=False
-        )  # [E, H//32, 2I]
+        )  # [E, H//32, 2I] uint8
 
         layer.w2_weight = Parameter(
-            npu_format_cast(qw2.transpose(1, 2)), requires_grad=False
-        )  # [E, I, H]
+            qw2.transpose(1, 2), requires_grad=False
+        )  # [E, I, H] float8_e4m3fn
         layer.w2_weight_scale = Parameter(
             s2.transpose(1, 2), requires_grad=False
-        )  # [E, I//32, H]
+        )  # [E, I//32, H] uint8
 
     def apply(
         self,
