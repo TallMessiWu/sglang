@@ -109,20 +109,21 @@ class NPUMXFP8FusedMoEMethod(FusedMoEMethodBase):
         qw2 = torch.stack(qw2_list).view(torch.float8_e4m3fn)  # [E, H, I]
         s2 = torch.stack(s2_list)  # [E, H, I//32] uint8
 
-        # Transpose for npu_grouped_matmul: [E, N, K] → [E, K, N] so K is dim-1.
-        # No npu_format_cast — MXFP8 grouped_matmul does not require NZ format (unlike INT8 path).
+        # Transpose + contiguous for per-expert npu_quant_matmul slicing:
+        # [E, N, K] → [E, K, N] contiguous so w[e] slices are contiguous.
+        # Matches dense NPUMXFP8LinearMethod which also uses .contiguous() after transpose.
         layer.w13_weight = Parameter(
-            qw13.transpose(1, 2), requires_grad=False
+            qw13.transpose(1, 2).contiguous(), requires_grad=False
         )  # [E, H, 2I] float8_e4m3fn
         layer.w13_weight_scale = Parameter(
-            s13.transpose(1, 2), requires_grad=False
+            s13.transpose(1, 2).contiguous(), requires_grad=False
         )  # [E, H//32, 2I] uint8
 
         layer.w2_weight = Parameter(
-            qw2.transpose(1, 2), requires_grad=False
+            qw2.transpose(1, 2).contiguous(), requires_grad=False
         )  # [E, I, H] float8_e4m3fn
         layer.w2_weight_scale = Parameter(
-            s2.transpose(1, 2), requires_grad=False
+            s2.transpose(1, 2).contiguous(), requires_grad=False
         )  # [E, I//32, H] uint8
 
     def apply(
