@@ -1048,16 +1048,15 @@ def npu_fused_experts_mxfp8(
     topk_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    """MXFP8 W8A8 fused MoE experts forward for Ascend NPU (A2/A3).
-
-    Uses per-expert npu_quant_matmul — the A2/A3-validated MXFP8 API from the
-    dense path — rather than npu_grouped_matmul (which has no MXFP8 support on A2/A3).
+    """MXFP8 W8A8 fused MoE experts forward for Ascend NPU.
 
     Args:
         hidden_states: BF16/FP16 activations, shape [tokens, H] or [B, S, H].
-        w13: float8_e4m3fn gate+up weights, shape [E, H, 2*I] (pre-transposed).
+        w13: float8_e4m3fn gate+up weights, shape [E, H, 2*I]
+             (transposed from [E, 2*I, H] in process_weights_after_loading).
         w13_scale: uint8 (UE8M0) weight scales, shape [E, H//32, 2*I].
-        w2: float8_e4m3fn down weights, shape [E, I, H] (pre-transposed).
+        w2: float8_e4m3fn down weights, shape [E, I, H]
+            (transposed from [E, H, I]).
         w2_scale: uint8 (UE8M0) weight scales, shape [E, I//32, H].
         topk_weights: router weights, shape [tokens, top_k].
         topk_ids: expert indices, shape [tokens, top_k] int32.
@@ -1077,7 +1076,6 @@ def npu_fused_experts_mxfp8(
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
 
-    # expert_tokens is cumulative token count per expert (group_list_type=1 convention)
     hidden_states, expanded_row_idx, expert_tokens, _ = (
         torch.ops.npu.npu_moe_init_routing_v2(
             hidden_states,
@@ -1092,63 +1090,47 @@ def npu_fused_experts_mxfp8(
     )
     expert_tokens = expert_tokens.to(torch.int64)
 
-    total_tokens = hidden_states.shape[0]
-    intermediate_x2 = w13.shape[2]  # 2*I
-    hidden_size = w2.shape[2]  # H
-
-    # gmm1: gate_up_proj — per-expert npu_quant_matmul (A2/A3 validated MXFP8 API)
-    gmm1_out = torch.empty(
-        total_tokens, intermediate_x2, dtype=original_dtype, device=hidden_states.device
+    # gmm1: gate_up_proj — dynamic MXFP8 activation quant
+    qx, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+        hidden_states, dst_type=torch_npu.float8_e4m3fn
     )
-    prev = 0
-    for e in range(num_experts):
-        end = expert_tokens[e].item()
-        if end > prev:
-            tokens_e = hidden_states[prev:end]
-            qx_e, scale_e = torch_npu.npu_dynamic_mx_quant(
-                tokens_e, dst_type=torch_npu.float8_e4m3fn
-            )
-            gmm1_out[prev:end] = torch_npu.npu_quant_matmul(
-                qx_e,
-                w13[e],
-                w13_scale[e],
-                scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
-                pertoken_scale=scale_e,
-                pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
-                output_dtype=original_dtype,
-                group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
-            )
-        prev = end
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[qx],
+        weight=[w13],
+        scale=[w13_scale],
+        per_token_scale=[pertoken_scale],
+        scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        per_token_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
 
-    # act_fn: swiglu [total_tokens, 2I] -> [total_tokens, I]
-    gmm1_out = torch.ops.npu.npu_swiglu(gmm1_out)
+    # act_fn: swiglu
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
 
-    # gmm2: down_proj — per-expert npu_quant_matmul
-    gmm2_out = torch.empty(
-        total_tokens, hidden_size, dtype=original_dtype, device=gmm1_out.device
+    # gmm2: down_proj — dynamic MXFP8 activation quant
+    qx2, pertoken_scale2 = torch_npu.npu_dynamic_mx_quant(
+        hidden_states, dst_type=torch_npu.float8_e4m3fn
     )
-    prev = 0
-    for e in range(num_experts):
-        end = expert_tokens[e].item()
-        if end > prev:
-            tokens_e = gmm1_out[prev:end]
-            qx_e, scale_e = torch_npu.npu_dynamic_mx_quant(
-                tokens_e, dst_type=torch_npu.float8_e4m3fn
-            )
-            gmm2_out[prev:end] = torch_npu.npu_quant_matmul(
-                qx_e,
-                w2[e],
-                w2_scale[e],
-                scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
-                pertoken_scale=scale_e,
-                pertoken_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
-                output_dtype=original_dtype,
-                group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
-            )
-        prev = end
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[qx2],
+        weight=[w2],
+        scale=[w2_scale],
+        per_token_scale=[pertoken_scale2],
+        scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        per_token_scale_dtype=_FLOAT8_E8M0FNU_DTYPE,
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
 
     final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
-        gmm2_out,
+        hidden_states,
         skip1=None,
         skip2=None,
         bias=None,
