@@ -6,9 +6,9 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
-from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_npu
 
-_is_npu = current_platform.is_npu()
+_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
