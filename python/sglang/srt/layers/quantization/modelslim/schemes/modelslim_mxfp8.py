@@ -10,9 +10,9 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
-from sglang.srt.platforms import current_platform
+from sglang.srt.utils import is_npu
 
-_is_npu = current_platform.is_npu()
+_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
