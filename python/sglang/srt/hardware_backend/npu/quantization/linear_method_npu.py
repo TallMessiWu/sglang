@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
+# W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
+MXFP4_BLOCK_SIZE = 32
 
 
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
@@ -23,6 +25,28 @@ def _get_float8_e8m0fnu_dtype():
     # imported early (during quant-scheme registration), so reading the dtype at
     # call time keeps it correct regardless of import order / platform.
     return getattr(torch, "float8_e8m0fnu", None)
+
+
+_FLOAT4_E2M1FN_X2_DTYPE = None
+
+
+def _get_float4_e2m1fn_x2_dtype():
+    # Packed-FP4 (x2) dtype used by the offline W4A8_MXFP path for the matmul's
+    # ``x2_dtype`` and for ``npu_format_cast``'s ``input_dtype``. Recent torch
+    # cores expose it directly; otherwise fall back to torch_npu on NPU. Resolved
+    # lazily (and cached) so this module stays importable on CUDA/CPU/AMD/XPU CI.
+    global _FLOAT4_E2M1FN_X2_DTYPE
+    if _FLOAT4_E2M1FN_X2_DTYPE is None:
+        dt = getattr(torch, "float4_e2m1fn_x2", None)
+        if dt is None:
+            from sglang.srt.utils import is_npu
+
+            if is_npu():
+                import torch_npu
+
+                dt = getattr(torch_npu, "float4_e2m1fn_x2", None)
+        _FLOAT4_E2M1FN_X2_DTYPE = dt
+    return _FLOAT4_E2M1FN_X2_DTYPE
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -472,6 +496,123 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             layer.weight_scale,
             bias=quant_bias,
             output_dtype=original_dtype,
+        )
+
+        # Restore original shape (replace last dim with output features).
+        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+        return output.reshape(output_shape)
+
+
+class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
+    """Ascend NPU offline W4A8 (ModelSlim ``W4A8_MXFP``): packed-FP4 weights + MXFP8 activations.
+
+    Kernel for the offline ModelSlimMXFP4W4A8Scheme (delegated as ``self.kernel``).
+    The msmodelslim ``W4A8_MXFP`` checkpoint stores weights as *packed FP4*
+    (``pack_fp4_to_uint8`` → ``uint8`` shape ``[out, in//2]``) plus UE8M0 block
+    scales (``uint8`` shape ``[out, in//group_size]``). This mirrors vllm-ascend's
+    ``AscendW4A8MXFPDynamicLinearMethod``:
+
+      process_weights_after_loading:
+        weight (uint8 packed FP4) → npu_format_cast(29, customize_dtype=float8_e4m3fn,
+            input_dtype=float4_e2m1fn_x2)  → unpacked FP4 in FRACTAL_NZ → transpose
+        weight_scale [out, in/32] → reshape [out, in/64, 2] → transpose → [in/64, out, 2]
+
+      apply:
+        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, MXFP8)
+        → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
+
+    Unlike the *online* ``NPUMXFP4W4A8LinearMethod`` (dual-level MXFP4, W4A4 compute
+    via ``npu_dual_level_quant_matmul``), this offline path is a true W4(weight)
+    A8(activation) single-level matmul. ``group_size`` is fixed at 32 by the
+    ``W4A8_MXFP`` export format.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # NPU-only, runtime import: npu_format_cast needs the FP4-unpack kwargs
+        # (customize_dtype / input_dtype) that the sglang util wrapper does not
+        # expose. Top-level torch_npu import is avoided to keep non-NPU CI green.
+        import torch_npu
+
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+
+        # Unpack packed-FP4 uint8 [out, in//2] into FP4 values laid out in
+        # FRACTAL_NZ (format 29), viewed through float8_e4m3fn containers, then
+        # transpose to [in, out] (matches vllm-ascend AscendW4A8MXFPDynamicLinearMethod).
+        weight = torch_npu.npu_format_cast(
+            layer.weight.data,
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        )
+        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
+
+        # Block scales: [out, in/32] uint8 → [in/64, out, 2] strided view, same
+        # re-layout as the MXFP8 offline path. Renamed to weight_scale_inv and the
+        # stale weight_scale dropped from named_parameters()/state_dict().
+        n_dim, k_dim = layer.weight_scale.data.shape
+        scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+        layer.weight_scale_inv = Parameter(scale.transpose(0, 1), requires_grad=False)
+        del layer.weight_scale
+
+        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
+        if (
+            getattr(layer, "bias", None) is not None
+            and layer.bias.dtype != torch.float32
+        ):
+            layer.bias_fp32 = Parameter(
+                layer.bias.data.to(torch.float32), requires_grad=False
+            )
+        else:
+            layer.bias_fp32 = None
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        original_dtype = x.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            x = x.to(torch.bfloat16)
+            original_dtype = torch.bfloat16
+
+        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1])
+
+        # Dynamic MXFP8 activation quantisation (A8).
+        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            x_2d, dst_type=torch.float8_e4m3fn
+        )
+
+        # Use the cached FP32 bias from process_weights_after_loading; fall back
+        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
+        if bias is None:
+            quant_bias = None
+        elif (
+            bias is getattr(layer, "bias", None)
+            and getattr(layer, "bias_fp32", None) is not None
+        ):
+            quant_bias = layer.bias_fp32
+        else:
+            quant_bias = bias.to(torch.float32)
+
+        e8m0_dtype = _get_float8_e8m0fnu_dtype()
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        # W4(weight)A8(activation) matmul: weight is FP4 (x2_dtype), activation is
+        # MXFP8. group_sizes=[0, 0, MXFP4_BLOCK_SIZE] matches vllm-ascend's W4A8
+        # (vs [1, 1, 32] for the FP8-weight MXFP8 path).
+        output = torch.ops.npu.npu_quant_matmul(
+            qx,
+            layer.weight,
+            layer.weight_scale_inv,
+            scale_dtype=e8m0_dtype,
+            pertoken_scale=input_scale,
+            pertoken_scale_dtype=e8m0_dtype,
+            bias=quant_bias,
+            output_dtype=original_dtype,
+            x2_dtype=fp4_dtype,
+            group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
         )
 
         # Restore original shape (replace last dim with output features).
