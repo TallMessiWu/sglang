@@ -566,6 +566,29 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
 
+        # [DEBUG-W4A8] temporary instrumentation: dump the real matmul operands so the
+        # segfaulting layer's actual format/shape/strides can be compared against the
+        # standalone diagnostic. Remove once the offline W4A8 e2e is fixed.
+        def _dbg(t):
+            if t is None:
+                return "None"
+            try:
+                f = torch_npu.get_npu_format(t)
+            except Exception as e:  # noqa: BLE001
+                f = f"<err {e}>"
+            return (
+                f"fmt={f} shape={tuple(t.shape)} dtype={t.dtype} "
+                f"contig={t.is_contiguous()} stride={tuple(t.stride())}"
+            )
+
+        print(f"[DEBUG-W4A8 apply] prefix={getattr(layer, 'prefix', '?')}", flush=True)
+        print("  layer.weight      :", _dbg(layer.weight), flush=True)
+        print("  layer.weight.data :", _dbg(layer.weight.data), flush=True)
+        print("  layer.weight_scale:", _dbg(layer.weight_scale), flush=True)
+        print("  quantized_x       :", _dbg(quantized_x), flush=True)
+        print("  dynamic_scale     :", _dbg(dynamic_scale), flush=True)
+        print("  bias              :", _dbg(bias), flush=True)
+
         # W4(weight)A8(activation) matmul, mirroring vllm-ascend exactly.
         output = torch_npu.npu_quant_matmul(
             quantized_x,
