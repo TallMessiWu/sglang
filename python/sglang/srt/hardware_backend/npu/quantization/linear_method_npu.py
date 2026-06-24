@@ -509,17 +509,21 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     Kernel for the offline ModelSlimMXFP4W4A8Scheme (delegated as ``self.kernel``).
     The msmodelslim ``W4A8_MXFP`` checkpoint stores weights as *packed FP4*
     (``pack_fp4_to_uint8`` → ``uint8`` shape ``[out, in//2]``) plus UE8M0 block
-    scales (``uint8`` shape ``[out, in//group_size]``). This mirrors vllm-ascend's
-    ``AscendW4A8MXFPDynamicLinearMethod``:
+    scales (``uint8`` shape ``[out, in//group_size]``):
 
       process_weights_after_loading:
-        weight (uint8 packed FP4) → npu_format_cast(29, customize_dtype=float8_e4m3fn,
-            input_dtype=float4_e2m1fn_x2)  → unpacked FP4 in FRACTAL_NZ → transpose
+        weight (uint8 packed FP4 [out, in//2]) → strided transpose view [in//2, out]
         weight_scale [out, in/32] → reshape [out, in/64, 2] → transpose → [in/64, out, 2]
 
       apply:
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, MXFP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
+
+    NOTE: vllm-ascend's ``AscendW4A8MXFPDynamicLinearMethod`` npu_format_cast's the
+    weight to FRACTAL_NZ first (for Ascend 950). Atlas A2/A3 forces
+    ``allow_internal_format=False`` (no NZ), but its FP4 ``npu_quant_matmul``
+    accepts plain ND packed-FP4 directly — so this method keeps ND strided views
+    and skips the format cast (see process_weights_after_loading).
 
     Unlike the *online* ``NPUMXFP4W4A8LinearMethod`` (dual-level MXFP4, W4A4 compute
     via ``npu_dual_level_quant_matmul``), this offline path is a true W4(weight)
@@ -528,27 +532,24 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # NPU-only, runtime import: npu_format_cast needs the FP4-unpack kwargs
-        # (customize_dtype / input_dtype) that the sglang util wrapper does not
-        # expose. Top-level torch_npu import is avoided to keep non-NPU CI green.
-        import torch_npu
+        # Atlas A2/A3 forces allow_internal_format=False, so FRACTAL_NZ weights
+        # are unavailable on this device class. The FP4 npu_quant_matmul accepts
+        # ND packed-FP4 weights directly, provided the weight and its block scale
+        # are passed as CONSISTENT strided transpose views. So, unlike vllm-ascend
+        # (which npu_format_cast's to NZ for Ascend 950), we keep plain ND strided
+        # views — an npu_format_cast(29) here actually makes the matmul reject the
+        # weight ("x2 should be in ... nz format, but it is 2") on this hardware.
+        #
+        # Packed-FP4 weight uint8 [out, in//2] -> strided transpose view
+        # [in//2, out]. Do NOT .contiguous(): the strided layout encodes the
+        # [out, in] origin the kernel reduces over, and a contiguous copy trips
+        # an internal device error (161002) here.
+        layer.weight = Parameter(layer.weight.data.transpose(0, 1), requires_grad=False)
 
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
-        # Unpack packed-FP4 uint8 [out, in//2] into FP4 values laid out in
-        # FRACTAL_NZ (format 29), viewed through float8_e4m3fn containers, then
-        # transpose to [in, out] (matches vllm-ascend AscendW4A8MXFPDynamicLinearMethod).
-        weight = torch_npu.npu_format_cast(
-            layer.weight.data,
-            29,
-            customize_dtype=torch.float8_e4m3fn,
-            input_dtype=fp4_dtype,
-        )
-        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
-
-        # Block scales: [out, in/32] uint8 → [in/64, out, 2] strided view, same
-        # re-layout as the MXFP8 offline path. Renamed to weight_scale_inv and the
-        # stale weight_scale dropped from named_parameters()/state_dict().
+        # Block scales [out, in/32] uint8 -> [in/64, out, 2] strided transpose
+        # view. Its transpose state MUST match the weight's, otherwise the kernel
+        # raises "x2 tensor and scale tensor's transpose are not same". Renamed to
+        # weight_scale_inv; the stale weight_scale is dropped.
         n_dim, k_dim = layer.weight_scale.data.shape
         scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
         layer.weight_scale_inv = Parameter(scale.transpose(0, 1), requires_grad=False)

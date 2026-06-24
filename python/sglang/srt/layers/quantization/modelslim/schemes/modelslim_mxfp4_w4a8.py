@@ -12,9 +12,10 @@ scheme: weights are 4-bit FP4, activations are dynamically quantised to MXFP8.
 This is NOT the same layout as ``W8A8_MXFP8`` (which stores float8_e4m3fn weights
 of shape [out, in]) — so weight creation and the forward pass differ from MXFP8.
 Weight post-processing and the matmul are delegated to ``NPUMXFP4W4A8OfflineLinearMethod``
-(``self.kernel``), mirroring vllm-ascend's ``AscendW4A8MXFPDynamicLinearMethod``
-(FP4 unpack via ``npu_format_cast`` + ``x2_dtype=float4_e2m1fn_x2`` matmul with
-``group_sizes=[0, 0, 32]``).
+(``self.kernel``): ND packed-FP4 weight + ``x2_dtype=float4_e2m1fn_x2`` matmul with
+``group_sizes=[0, 0, 32]``. (vllm-ascend's ``AscendW4A8MXFPDynamicLinearMethod`` first
+casts the weight to FRACTAL_NZ for Ascend 950; Atlas A2/A3 has no NZ and takes ND
+directly — see the kernel for details.)
 """
 
 from typing import Dict, List, Optional
