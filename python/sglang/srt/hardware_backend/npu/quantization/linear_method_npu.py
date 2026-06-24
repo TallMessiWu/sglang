@@ -603,6 +603,13 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
         )
 
+        # [DEBUG-W4A8] force a device sync so an async kernel error surfaces HERE,
+        # pinned to the matmul whose operands were just printed above, instead of
+        # leaking out as a misattributed segfault at a later sync point. Remove
+        # together with the dump instrumentation once the e2e is fixed.
+        torch.npu.synchronize()
+        print("  -> matmul OK", flush=True)
+
         # Restore original shape (replace last dim with output features).
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
