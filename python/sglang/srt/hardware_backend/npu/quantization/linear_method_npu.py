@@ -490,22 +490,27 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     scales (``uint8`` shape ``[out, in//group_size]``):
 
       process_weights_after_loading:
-        weight (uint8 packed FP4 [out, in//2]) → transpose [in//2, out]  (plain ND)
+        weight (uint8 packed FP4 [out, in//2]) → npu_format_cast(29,
+            customize_dtype=float8_e4m3fn, input_dtype=float4_e2m1fn_x2) → FRACTAL_NZ
+            → transpose [in//2, out]
         weight_scale [out, in/32] → reshape [out, in/64, 2] → transpose → [in/64, out, 2]
 
       apply:
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, MXFP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    The weight is kept in plain **ND** format — do NOT npu_format_cast it to
-    FRACTAL_NZ (29). On Ascend 950 the device forces allow_internal_format=False
-    (NZ unavailable), and the FP4 npu_quant_matmul accepts x2 only in ND
-    ("original image format"). A transposed NZ view is rejected with
-    "x2 ... it is 2" and a contiguous NZ weight with "... it is 50"; only the ND
-    transpose view works (verified on-device). The FP4 unpack is driven by
-    ``x2_dtype`` + ``group_sizes`` in apply(), so dropping the format cast does not
-    change the numerics. (vllm-ascend ``AscendW4A8MXFPDynamicLinearMethod`` casts to
-    NZ here, but that path does not run on this hardware.)
+    Mirrors vllm-ascend ``AscendW4A8MXFPDynamicLinearMethod`` exactly (Ascend 950/A5).
+    The weight is cast to FRACTAL_NZ then transposed; ``npu_dynamic_mx_quant`` already
+    returns a 3D ``[tokens, in//64, 2]`` block scale so the matmul needs no extra
+    scale-layout normalization.
+
+    ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
+    A5 this device forces ``allow_internal_format=False`` (the NZ cast still produces
+    a ``FRACTAL_NZ_C0_16`` tensor). Older torch_npu (e.g. ``2.10.0.dev20260320``)
+    had a broken FP4 matmul that rejected the NZ weight ("x2 ... it is 2") or
+    segfaulted in ``atb::OperationSetup``; ``2.10.0.post1.dev20260624`` (and later)
+    runs the vllm-aligned NZ path correctly. If you hit those errors, update
+    torch_npu — do NOT "fix" it by switching the weight to ND.
 
     Unlike the *online* ``NPUMXFP4W4A8LinearMethod`` (dual-level MXFP4, W4A4 compute
     via ``npu_dual_level_quant_matmul``), this offline path is a true W4(weight)
@@ -514,17 +519,21 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Lay out the packed-FP4 weight + UE8M0 block scales for npu_quant_matmul.
-        #
-        # Do NOT npu_format_cast the weight to FRACTAL_NZ (29) here. On Ascend 950
-        # the device forces allow_internal_format=False, so NZ is unavailable and
-        # the FP4 npu_quant_matmul accepts x2 only in plain ND. Casting to NZ then
-        # transposing yields a strided NZ view the matmul rejects ("x2 ... it is
-        # 2"); a contiguous NZ weight is also rejected ("... it is 50"). The plain
-        # ND transpose view is accepted and numerically correct — the FP4 unpack is
-        # driven by x2_dtype + group_sizes in apply(), not by the format cast.
-        #
-        # weight: packed-FP4 uint8 [out, in//2] -> transpose to [in//2, out] (ND).
+        # Mirror vllm-ascend AscendW4A8MXFPDynamicLinearMethod: cast the packed-FP4
+        # weight to FRACTAL_NZ then transpose. npu_format_cast needs the FP4-unpack
+        # kwargs the sglang util wrapper doesn't expose, hence the runtime
+        # torch_npu import (NPU-only). Requires a recent torch_npu (see class
+        # docstring): older builds reject the NZ weight ("x2 ... it is 2").
+        import torch_npu
+
+        # weight: packed-FP4 uint8 [out, in//2] -> FRACTAL_NZ (float8_e4m3fn view)
+        # -> transpose to [in//2, out].
+        layer.weight.data = torch_npu.npu_format_cast(
+            layer.weight.data,
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        )
         layer.weight.data = layer.weight.data.transpose(-1, -2)
         # weight_scale: [out, in/32] uint8 -> [in/64, out, 2].
         n, k = layer.weight_scale.data.shape
