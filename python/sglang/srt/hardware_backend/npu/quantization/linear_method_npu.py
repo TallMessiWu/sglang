@@ -27,28 +27,6 @@ def _get_float8_e8m0fnu_dtype():
     return getattr(torch, "float8_e8m0fnu", None)
 
 
-_FLOAT4_E2M1FN_X2_DTYPE = None
-
-
-def _get_float4_e2m1fn_x2_dtype():
-    # Packed-FP4 (x2) dtype used by the offline W4A8_MXFP path for the matmul's
-    # ``x2_dtype`` and for ``npu_format_cast``'s ``input_dtype``. Recent torch
-    # cores expose it directly; otherwise fall back to torch_npu on NPU. Resolved
-    # lazily (and cached) so this module stays importable on CUDA/CPU/AMD/XPU CI.
-    global _FLOAT4_E2M1FN_X2_DTYPE
-    if _FLOAT4_E2M1FN_X2_DTYPE is None:
-        dt = getattr(torch, "float4_e2m1fn_x2", None)
-        if dt is None:
-            from sglang.srt.utils import is_npu
-
-            if is_npu():
-                import torch_npu
-
-                dt = getattr(torch_npu, "float4_e2m1fn_x2", None)
-        _FLOAT4_E2M1FN_X2_DTYPE = dt
-    return _FLOAT4_E2M1FN_X2_DTYPE
-
-
 class _NPULinearMethodBase(LinearMethodBase):
 
     def __init__(
@@ -532,49 +510,26 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # NPU-only runtime import: npu_format_cast needs the FP4-unpack kwargs
-        # (customize_dtype / input_dtype) the sglang util wrapper doesn't expose.
+        # Mirror vllm-ascend AscendW4A8MXFPDynamicLinearMethod EXACTLY: in-place
+        # ``.data`` assignment (keep the Parameter objects / names), torch_npu.*
+        # ops. npu_format_cast needs the FP4-unpack kwargs the sglang util wrapper
+        # doesn't expose, hence the runtime torch_npu import (NPU-only).
         import torch_npu
 
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
-        # MXFP4: unpack packed-FP4 uint8 [out, in//2] into FRACTAL_NZ (format 29),
-        # viewed through float8_e4m3fn containers, then transpose to [in//2, out].
-        # Mirrors vllm-ascend AscendW4A8MXFPDynamicLinearMethod.
-        #
-        # REQUIRES internal (NZ) format support, i.e.
-        # ``torch_npu.npu.config.allow_internal_format = True`` (Ascend 950/A5;
-        # vllm-ascend sets it in model_runner_v1.py). If the runtime reports
-        # "Current device only support allow_internal_format=False", the FP4
-        # npu_quant_matmul rejects the weight ("x2 ... it is 2") or segfaults in
-        # atb::OperationSetup — that is a torch_npu / CANN environment problem
-        # (NZ unavailable), NOT a layout bug in this code.
-        weight = torch_npu.npu_format_cast(
+        # weight: packed-FP4 uint8 [out, in//2] -> FRACTAL_NZ (float8_e4m3fn view)
+        # -> transpose to [in//2, out].
+        layer.weight.data = torch_npu.npu_format_cast(
             layer.weight.data,
             29,
             customize_dtype=torch.float8_e4m3fn,
-            input_dtype=fp4_dtype,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
         )
-        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
-
-        # Block scales [out, in/32] uint8 -> [in/64, out, 2] strided view (same
-        # re-layout as the MXFP8 offline path). Renamed to weight_scale_inv; the
-        # stale weight_scale is dropped.
-        n_dim, k_dim = layer.weight_scale.data.shape
-        scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
-        layer.weight_scale_inv = Parameter(scale.transpose(0, 1), requires_grad=False)
-        del layer.weight_scale
-
-        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
-        if (
-            getattr(layer, "bias", None) is not None
-            and layer.bias.dtype != torch.float32
-        ):
-            layer.bias_fp32 = Parameter(
-                layer.bias.data.to(torch.float32), requires_grad=False
-            )
-        else:
-            layer.bias_fp32 = None
+        layer.weight.data = layer.weight.data.transpose(-1, -2)
+        # weight_scale: [out, in/32] uint8 -> [in/64, out, 2].
+        n, k = layer.weight_scale.data.shape
+        layer.weight_scale.data = layer.weight_scale.data.reshape(
+            n, k // 2, 2
+        ).transpose(-3, -2)
 
     def apply(
         self,
@@ -582,6 +537,8 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import torch_npu
+
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
@@ -592,37 +549,24 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         x_2d = x.reshape(-1, x.shape[-1])
 
         # Dynamic MXFP8 activation quantisation (A8).
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
-        if bias is None:
-            quant_bias = None
-        elif (
-            bias is getattr(layer, "bias", None)
-            and getattr(layer, "bias_fp32", None) is not None
-        ):
-            quant_bias = layer.bias_fp32
-        else:
-            quant_bias = bias.to(torch.float32)
+        if bias is not None and bias.dtype != torch.float32:
+            bias = bias.to(torch.float32)
 
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        # W4(weight)A8(activation) matmul: weight is FP4 (x2_dtype), activation is
-        # MXFP8. group_sizes=[0, 0, MXFP4_BLOCK_SIZE] matches vllm-ascend's W4A8
-        # (vs [1, 1, 32] for the FP8-weight MXFP8 path).
-        output = torch.ops.npu.npu_quant_matmul(
-            qx,
+        # W4(weight)A8(activation) matmul, mirroring vllm-ascend exactly.
+        output = torch_npu.npu_quant_matmul(
+            quantized_x,
             layer.weight,
-            layer.weight_scale_inv,
-            scale_dtype=e8m0_dtype,
-            pertoken_scale=input_scale,
-            pertoken_scale_dtype=e8m0_dtype,
-            bias=quant_bias,
+            layer.weight_scale,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale=dynamic_scale,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            bias=bias,
             output_dtype=original_dtype,
-            x2_dtype=fp4_dtype,
+            x2_dtype=torch_npu.float4_e2m1fn_x2,
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
         )
 
