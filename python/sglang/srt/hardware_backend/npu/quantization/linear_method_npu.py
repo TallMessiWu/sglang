@@ -506,11 +506,20 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
     ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
     A5 this device forces ``allow_internal_format=False`` (the NZ cast still produces
-    a ``FRACTAL_NZ_C0_16`` tensor). Older torch_npu (e.g. ``2.10.0.dev20260320``)
-    had a broken FP4 matmul that rejected the NZ weight ("x2 ... it is 2") or
-    segfaulted in ``atb::OperationSetup``; ``2.10.0.post1.dev20260624`` (and later)
-    runs the vllm-aligned NZ path correctly. If you hit those errors, update
-    torch_npu — do NOT "fix" it by switching the weight to ND.
+    a ``FRACTAL_NZ_C0_16`` tensor, which is fine). Older torch_npu (e.g.
+    ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
+    *prefill* with ``x2 should be in ... nz format, but it is 2``;
+    ``2.10.0.post1.dev20260624`` (and later) runs the vllm-aligned NZ path
+    correctly. If you hit ``it is 2``, update torch_npu — do NOT "fix" it by
+    switching the weight to ND.
+
+    ⚠️ A ``atb::OperationSetup`` *segfault during decode* (not prefill) is a
+    DIFFERENT, unrelated issue: it is the eager-decode ``ascend`` attention
+    backend, NOT this matmul (verified by stage-sync bisection — qkv's matmul
+    syncs clean, the fault surfaces at the entry-sync of the next layer, i.e. the
+    decode attention between qkv and o_proj). Run with the NPU decode graph (do
+    NOT pass ``--disable-cuda-graph``); graph mode is the NPU default and what
+    vllm uses. This attention issue is model-agnostic and out of scope for W4A8.
 
     Unlike the *online* ``NPUMXFP4W4A8LinearMethod`` (dual-level MXFP4, W4A4 compute
     via ``npu_dual_level_quant_matmul``), this offline path is a true W4(weight)
