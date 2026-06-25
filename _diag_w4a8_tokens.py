@@ -1,106 +1,70 @@
-"""[TEMP DEBUG] W4A8_MXFP A5 诊断 v4：子进程网格扫描 (shape x token数 M)。
+"""[TEMP DEBUG] W4A8_MXFP A5 诊断 v5：主进程内降序扫 M，定位 decode 小 M 阈值。
 
-在 A5 上跑：python _diag_w4a8_tokens.py
+在 A5 上跑（sglang/qwen3_dense_w4a8/ 目录下）：python _diag_w4a8_tokens.py
 
-e2e 定位到崩在 decode（M=1 单 token）的 FP4 matmul；之前诊断只测 M=128/16（prefill 尺寸）。
-本脚本对每个 (shape, M) 组合**单独 fork 一个子进程**跑 1 次 matmul+sync，
-段错误(-11)只杀子进程不影响整张表 —— 最后打印哪个组合 OK / SEGV / ERR。
-调试完随其余 W4A8 debug 插桩一起删除。
+v4 的子进程网格在这环境里每个 worker 都 HANG（torch_npu 在 fork 出来的裸子进程里
+卡在设备初始化，跟矩阵乘无关），已废弃。本版回到**主进程**直跑（与早先能跑通的
+diag_w4a8_shapes.py 同款），对 o_proj 形状 (4096,4096) 按 M **从大到小** 扫描：
+能跑的大 M 先逐个打印 OK，跑到某个小 M 卡住(HANG)就停 —— 最后一个打印的
+`trying M=X` 后面没有 `OK M=X`，那个 X 就是会挂的最大 M，它上面那个 OK 的 M
+就是「最小安全 M」（= apply 里要 pad 到的阈值）。
+
+卡住后直接 Ctrl-C 即可，把已打印的行贴回来。
 """
 
-import sys
+import torch
+import torch_npu
 
+DEV = "npu:0"
 BLK = 32
+
+# 确认会崩的 o_proj；如需对比再加 ("qkv_proj", 6144, 4096)
 SHAPES = [
-    ("qkv_proj", 6144, 4096),
     ("o_proj", 4096, 4096),
-    ("gate_up_proj", 24576, 4096),
-    ("down_proj", 4096, 12288),
 ]
-MS = [1, 2, 3, 4, 6, 8, 16, 32, 128]
+# 降序：大 M 先过，卡在边界停
+MS = [128, 96, 64, 48, 32, 24, 16, 12, 8, 6, 4, 3, 2, 1]
 
 
-def worker(out, in_, m):
-    import torch
-    import torch_npu
-
-    dev = "npu:0"
-    try:
-        torch_npu.npu.config.allow_internal_format = True  # 会被打回 False，正常
-    except Exception:  # noqa: BLE001
-        pass
-
-    # NZ weight: packed-FP4 uint8 [out, in//2] -> cast29 -> transpose [in//2, out]
-    w = torch.randint(0, 255, (out, in_ // 2), dtype=torch.uint8, device=dev)
+def build_nz_weight(out, in_):
+    w = torch.randint(0, 255, (out, in_ // 2), dtype=torch.uint8, device=DEV)
     w = torch_npu.npu_format_cast(
         w, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
     ).transpose(-1, -2)
-    # weight_scale: [out, in//32] -> [in//64, out, 2]
-    s = torch.randint(0, 255, (out, in_ // BLK), dtype=torch.uint8, device=dev)
+    s = torch.randint(0, 255, (out, in_ // BLK), dtype=torch.uint8, device=DEV)
     n, k = s.shape
     wscale = s.reshape(n, k // 2, 2).transpose(-3, -2)
-
-    x = torch.randn(m, in_, dtype=torch.bfloat16, device=dev)
-    qx, dscale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
-
-    out_t = torch_npu.npu_quant_matmul(
-        qx,
-        w,
-        wscale,
-        scale_dtype=torch_npu.float8_e8m0fnu,
-        pertoken_scale=dscale,
-        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-        bias=None,
-        output_dtype=torch.bfloat16,
-        x2_dtype=torch_npu.float4_e2m1fn_x2,
-        group_sizes=[0, 0, BLK],
-    )
-    torch.npu.synchronize()  # 强制异步错误当场暴露
-    assert out_t.shape == (m, out)
-    print("WORKER_OK", flush=True)
+    return w, wscale
 
 
-def driver():
-    import subprocess
+print("=" * 72, flush=True)
+print("torch", torch.__version__, "| torch_npu", torch_npu.__version__, flush=True)
+try:
+    torch_npu.npu.config.allow_internal_format = True  # 会被打回 False，正常
+except Exception as e:  # noqa: BLE001
+    print("set allow_internal_format:", e, flush=True)
+print("=" * 72, flush=True)
 
-    timeout_s = 90
-    print("=" * 86, flush=True)
-    print(f"W4A8 FP4 matmul 网格 (shape x M)  —  OK / SEGV<rc> / HANG / ERR  (timeout={timeout_s}s)", flush=True)
-    print("=" * 86, flush=True)
-    rows = []
-    for name, out, in_ in SHAPES:
-        cells = []
-        for m in MS:
-            try:
-                r = subprocess.run(
-                    [sys.executable, __file__, str(out), str(in_), str(m)],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                )
-                if r.returncode == 0 and "WORKER_OK" in r.stdout:
-                    cell = "OK"
-                elif r.returncode < 0:
-                    cell = f"SEGV{r.returncode}"
-                else:
-                    cell = "ERR"
-            except subprocess.TimeoutExpired:
-                cell = "HANG"
-            # 逐格实时打印，方便看进度/卡点
-            print(f"  {name:14} M={m:<4} -> {cell}", flush=True)
-            cells.append(cell)
-        rows.append((name, cells))
+for name, out, in_ in SHAPES:
+    print(f"\n### {name}  OUT={out} IN={in_}  (M 降序，卡住即为阈值边界)", flush=True)
+    weight, wscale = build_nz_weight(out, in_)
+    for m in MS:
+        x = torch.randn(m, in_, dtype=torch.bfloat16, device=DEV)
+        qx, dscale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+        print(f"  trying M={m} ...", flush=True)  # 卡住时这是最后一行
+        try:
+            out_t = torch_npu.npu_quant_matmul(
+                qx, weight, wscale,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale=dscale, pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                bias=None, output_dtype=torch.bfloat16,
+                x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[0, 0, BLK],
+            )
+            torch.npu.synchronize()
+            print(f"  OK M={m} out={tuple(out_t.shape)}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ERR M={m}: {e}", flush=True)
 
-    print("\n" + "=" * 86, flush=True)
-    print("shape".ljust(14) + "".join(f"M={m}".rjust(8) for m in MS), flush=True)
-    for name, cells in rows:
-        print(name.ljust(14) + "".join(c.rjust(8) for c in cells), flush=True)
-    print("=" * 86, flush=True)
-    print("判断：HANG/SEGV 是 M=1 通杀还是 shape+M 组合相关，最小安全 M 是多少。", flush=True)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 4:
-        worker(int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]))
-    else:
-        driver()
+print("\n" + "=" * 72, flush=True)
+print("最后一个 OK 的 M = 最小安全阈值；它下面 trying 后没 OK 的 M 会 HANG。", flush=True)
+print("=" * 72, flush=True)
