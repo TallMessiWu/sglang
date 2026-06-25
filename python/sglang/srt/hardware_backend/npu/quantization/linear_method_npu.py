@@ -549,17 +549,6 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     ) -> torch.Tensor:
         import torch_npu
 
-        # [DEBUG-W4A8] STAGE-1 entry sync: surfaces any async fault from the op that
-        # ran BEFORE this linear (e.g. the decode attention between qkv and o_proj).
-        # If the crash lands here, the culprit is upstream of this matmul, not us.
-        print(
-            f"[DEBUG-W4A8 apply] prefix={getattr(layer, 'prefix', '?')} "
-            f"x.shape={tuple(x.shape)}",
-            flush=True,
-        )
-        torch.npu.synchronize()
-        print("  S1 entry-sync OK (preceding op clean)", flush=True)
-
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
@@ -574,35 +563,8 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # [DEBUG-W4A8] STAGE-2 sync: isolates npu_dynamic_mx_quant from the matmul.
-        torch.npu.synchronize()
-        print("  S2 dynamic-quant-sync OK", flush=True)
-
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
-
-        # [DEBUG-W4A8] temporary instrumentation: dump the real matmul operands so the
-        # segfaulting layer's actual format/shape/strides can be compared against the
-        # standalone diagnostic. Remove once the offline W4A8 e2e is fixed.
-        def _dbg(t):
-            if t is None:
-                return "None"
-            try:
-                f = torch_npu.get_npu_format(t)
-            except Exception as e:  # noqa: BLE001
-                f = f"<err {e}>"
-            return (
-                f"fmt={f} shape={tuple(t.shape)} dtype={t.dtype} "
-                f"contig={t.is_contiguous()} stride={tuple(t.stride())}"
-            )
-
-        print(f"[DEBUG-W4A8 apply] prefix={getattr(layer, 'prefix', '?')}", flush=True)
-        print("  layer.weight      :", _dbg(layer.weight), flush=True)
-        print("  layer.weight.data :", _dbg(layer.weight.data), flush=True)
-        print("  layer.weight_scale:", _dbg(layer.weight_scale), flush=True)
-        print("  quantized_x       :", _dbg(quantized_x), flush=True)
-        print("  dynamic_scale     :", _dbg(dynamic_scale), flush=True)
-        print("  bias              :", _dbg(bias), flush=True)
 
         # W4(weight)A8(activation) matmul, mirroring vllm-ascend exactly.
         output = torch_npu.npu_quant_matmul(
@@ -617,13 +579,6 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x2_dtype=torch_npu.float4_e2m1fn_x2,
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
         )
-
-        # [DEBUG-W4A8] force a device sync so an async kernel error surfaces HERE,
-        # pinned to the matmul whose operands were just printed above, instead of
-        # leaking out as a misattributed segfault at a later sync point. Remove
-        # together with the dump instrumentation once the e2e is fixed.
-        torch.npu.synchronize()
-        print("  S3 matmul-sync OK", flush=True)
 
         # Restore original shape (replace last dim with output features).
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
