@@ -317,21 +317,26 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
     """Ascend NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
 
-    Weight quantization flow (process_weights_after_loading):
-        BF16/FP16 weight → npu_dynamic_dual_level_mx_quant → FP4 + l0_scale(FP32) + l1_scale(FP8_E8M0)
-        → npu_format_cast to FRACTAL_NZ (required by npu_dual_level_quant_matmul)
-        → w_dual_scale transposed to [in/512, out] (required by matmul API)
+    This is a *true* W4(weight) A8(activation) path: it mirrors the offline
+    ``W4A8_MXFP`` kernel (``NPUMXFP4W4A8OfflineLinearMethod``) exactly — the only
+    difference is that the FP4 weights are produced online from BF16/FP16
+    (round-to-nearest, no calibration) instead of being loaded from a msmodelslim
+    checkpoint. An earlier version of this method ran a *dual-level* scheme that
+    also compressed the activation to FP4 (W4A4 compute via
+    ``npu_dual_level_quant_matmul``); that was a large accuracy regression — 4-bit
+    activations — so it was replaced with the single-level FP8-activation path
+    below, aligned with the offline W4A8 implementation.
 
-    Inference flow (apply):
-        FP16/BF16 activation → npu_dynamic_dual_level_mx_quant → FP4 + act_l0_scale + act_l1_scale
-        → npu_dual_level_quant_matmul(FP4_act, FP4_weight, scales...) → FP16/BF16 output
+    Weight quantization (process_weights_after_loading):
+        BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2) → packed FP4
+        + UE8M0 block scale → npu_format_cast to FRACTAL_NZ → transpose [in//2, out]
 
-    Note: The "A8" refers to the MXFP8 intermediate scale format (FP8_E8M0 l1_scale).
-    The actual matmul compute is W4A4 (both operands in FP4) since there is no
-    W4A8 mixed-precision kernel in the current torch_npu public API.
+    Inference (apply):
+        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
+        → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    Hardware requirement: Ascend 950 (Atlas A3). DualLevelQuantBatchMatmul is
-    NOT supported on Atlas 800I A2/A3 or earlier chips.
+    Hardware: Ascend 950 (A5) + a recent torch_npu with the FP4 npu_quant_matmul
+    (same requirement as the offline W4A8 path — see that class's docstring).
     """
 
     def create_weights(
@@ -369,58 +374,43 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.utils import get_npu_memory_capacity
-
-        # Heuristic hardware check: npu_dynamic_dual_level_mx_quant requires
-        # Ascend 950. Atlas A2/A3 have ≤64 GB per card; Ascend 950 has ≥96 GB.
-        npu_mem_mb = get_npu_memory_capacity()
-        if npu_mem_mb < 96 * 1024:
-            logger.warning(
-                "MXFP4 W4A8 dual-level quantization may not be supported on this "
-                "hardware (detected NPU memory %.1f GB < 96 GB). "
-                "npu_dynamic_dual_level_mx_quant requires Ascend 950 (Atlas A3). "
-                "Continuing — expect a RuntimeError if the kernel is unavailable.",
-                npu_mem_mb / 1024,
-            )
+        # Online single-level MXFP4 weight quant, then lay the weight out exactly
+        # like the offline W4A8 path so the same npu_quant_matmul(x2_dtype=fp4)
+        # kernel accepts it. npu_format_cast needs the FP4-unpack kwargs the sglang
+        # util wrapper doesn't expose, hence the runtime torch_npu import (NPU-only).
+        import torch_npu
 
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)
-
         # Move to NPU if needed (cpu offload may have put it on CPU).
         if not weight_fp.is_npu:
             weight_fp = weight_fp.to(f"npu:{torch.npu.current_device()}")
 
-        # Online MXFP4 dual-level quantisation of weights.
-        # qw:          float4_e2m1fn_x2, shape [out, in]
-        # w_dual_scale: float32,          shape [out, in/512, 1]  (L0)
-        # w_scale:      float8_e8m0,      shape [out, (ceil(in/32)+1)//2, 2]  (L1)
-        try:
-            qw, w_dual_scale, w_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
-                weight_fp, smooth_scale=None
-            )
-        except (RuntimeError, AttributeError) as e:
-            raise RuntimeError(
-                "npu_dynamic_dual_level_mx_quant failed — this operation requires "
-                "Ascend 950 (Atlas A3). Atlas 800I A2/A3 and earlier chips do NOT "
-                "support DualLevelQuantBatchMatmul. "
-                f"Original error: {e}"
-            ) from e
+        # BF16 -> packed FP4 (float4_e2m1fn_x2, [out, in//2]) + UE8M0 block scale.
+        # npu_dynamic_mx_quant returns the scale as [out, in//64, 2] (3D); older
+        # builds may return [out, in//32] (2D) — handle both before the transpose.
+        qw, w_scale = torch_npu.npu_dynamic_mx_quant(
+            weight_fp, dst_type=torch_npu.float4_e2m1fn_x2, round_mode="round"
+        )
 
-        # npu_dual_level_quant_matmul requires x2 in FRACTAL_NZ format (format=29);
-        # view as int8 first because npu_format_cast only accepts int-dtype tensors.
-        qw = torch.ops.npu.npu_format_cast(qw.view(torch.int8), 29)
+        # weight: packed FP4 -> FRACTAL_NZ (float8_e4m3fn view) -> transpose
+        # [in//2, out]. Mirror the offline path (no .contiguous() on the NZ view);
+        # view as uint8 first because npu_format_cast only accepts int-dtype tensors.
+        qw_nz = torch_npu.npu_format_cast(
+            qw.view(torch.uint8),
+            29,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+        layer.weight = Parameter(qw_nz.transpose(-1, -2), requires_grad=False)
 
-        # npu_dual_level_quant_matmul expects x2_level0_scale shape [in/512, out]:
-        # squeeze the trailing dim-1 axis, then transpose + contiguous.
-        # NOTE: the strided-view (no .contiguous()) layout used by the MXFP8 dense
-        # path regressed perf on Ascend 950/A3 for W4A8, so the contiguous copy is
-        # kept here (perf-regression revert, 2026-06-16).
-        w_dual_scale = w_dual_scale.squeeze(-1).transpose(0, 1).contiguous()
+        # weight_scale -> [in//64, out, 2] to match npu_quant_matmul.
+        if w_scale.dim() == 2:
+            n, k = w_scale.shape
+            w_scale = w_scale.reshape(n, k // 2, 2)
+        layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
 
-        layer.weight = Parameter(qw, requires_grad=False)
-        layer.weight_dual_scale = Parameter(w_dual_scale, requires_grad=False)
-        layer.weight_scale = Parameter(w_scale, requires_grad=False)
         # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
         if (
             getattr(layer, "bias", None) is not None
@@ -438,18 +428,20 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import torch_npu
+
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
             original_dtype = torch.bfloat16
 
-        # Flatten to 2D [tokens, hidden] for the dual-level quant API.
+        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP4 activation quantisation (W4 activations → A4 for matmul).
-        qx, act_l0_scale, act_l1_scale = torch.ops.npu.npu_dynamic_dual_level_mx_quant(
-            x_2d, smooth_scale=None
+        # Dynamic MXFP8 activation quantisation (A8 — FP8, not FP4).
+        quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
+            x_2d, dst_type=torch.float8_e4m3fn
         )
 
         # Use the cached FP32 bias from process_weights_after_loading; fall back
@@ -464,16 +456,18 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         else:
             quant_bias = bias.to(torch.float32)
 
-        # MXFP4 matmul: W4A4 compute (weight already in NZ format + transposed scales).
-        output = torch.ops.npu.npu_dual_level_quant_matmul(
-            qx,
+        # True W4(weight)A8(activation) matmul, identical to the offline path.
+        output = torch_npu.npu_quant_matmul(
+            quantized_x,
             layer.weight,
-            act_l0_scale,
-            layer.weight_dual_scale,
-            act_l1_scale,
             layer.weight_scale,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale=dynamic_scale,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
             bias=quant_bias,
             output_dtype=original_dtype,
+            x2_dtype=torch_npu.float4_e2m1fn_x2,
+            group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
         )
 
         # Restore original shape (replace last dim with output features).
@@ -521,10 +515,11 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     NOT pass ``--disable-cuda-graph``); graph mode is the NPU default and what
     vllm uses. This attention issue is model-agnostic and out of scope for W4A8.
 
-    Unlike the *online* ``NPUMXFP4W4A8LinearMethod`` (dual-level MXFP4, W4A4 compute
-    via ``npu_dual_level_quant_matmul``), this offline path is a true W4(weight)
-    A8(activation) single-level matmul. ``group_size`` is fixed at 32 by the
-    ``W4A8_MXFP`` export format.
+    This is a true W4(weight) A8(activation) single-level matmul. The *online*
+    ``NPUMXFP4W4A8LinearMethod`` now uses this exact apply path — the only
+    difference is that it quantizes BF16/FP16 weights to FP4 at load time instead
+    of loading them from a msmodelslim checkpoint. ``group_size`` is fixed at 32
+    by the ``W4A8_MXFP`` export format.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
