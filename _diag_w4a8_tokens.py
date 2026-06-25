@@ -63,29 +63,40 @@ def worker(out, in_, m):
 def driver():
     import subprocess
 
+    timeout_s = 90
     print("=" * 86, flush=True)
-    print("W4A8 FP4 matmul 网格 (shape x M)  —  OK / SEGV<rc> / ERR", flush=True)
+    print(f"W4A8 FP4 matmul 网格 (shape x M)  —  OK / SEGV<rc> / HANG / ERR  (timeout={timeout_s}s)", flush=True)
     print("=" * 86, flush=True)
-    print("shape".ljust(14) + "".join(f"M={m}".rjust(8) for m in MS), flush=True)
+    rows = []
     for name, out, in_ in SHAPES:
-        row = name.ljust(14)
+        cells = []
         for m in MS:
-            r = subprocess.run(
-                [sys.executable, __file__, str(out), str(in_), str(m)],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode == 0 and "WORKER_OK" in r.stdout:
-                cell = "OK"
-            elif r.returncode < 0:
-                cell = f"SEGV{r.returncode}"
-            else:
-                cell = "ERR"
-            row += cell.rjust(8)
-        print(row, flush=True)
+            try:
+                r = subprocess.run(
+                    [sys.executable, __file__, str(out), str(in_), str(m)],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                )
+                if r.returncode == 0 and "WORKER_OK" in r.stdout:
+                    cell = "OK"
+                elif r.returncode < 0:
+                    cell = f"SEGV{r.returncode}"
+                else:
+                    cell = "ERR"
+            except subprocess.TimeoutExpired:
+                cell = "HANG"
+            # 逐格实时打印，方便看进度/卡点
+            print(f"  {name:14} M={m:<4} -> {cell}", flush=True)
+            cells.append(cell)
+        rows.append((name, cells))
+
+    print("\n" + "=" * 86, flush=True)
+    print("shape".ljust(14) + "".join(f"M={m}".rjust(8) for m in MS), flush=True)
+    for name, cells in rows:
+        print(name.ljust(14) + "".join(c.rjust(8) for c in cells), flush=True)
     print("=" * 86, flush=True)
-    print("看哪些 (shape,M) 是 SEGV：判断是 M=1 通杀，还是 shape+M 组合相关，", flush=True)
-    print("以及最小安全 M（决定 apply 里 pad 到多少）。", flush=True)
+    print("判断：HANG/SEGV 是 M=1 通杀还是 shape+M 组合相关，最小安全 M 是多少。", flush=True)
 
 
 if __name__ == "__main__":
