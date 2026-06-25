@@ -549,6 +549,17 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     ) -> torch.Tensor:
         import torch_npu
 
+        # [DEBUG-W4A8] STAGE-1 entry sync: surfaces any async fault from the op that
+        # ran BEFORE this linear (e.g. the decode attention between qkv and o_proj).
+        # If the crash lands here, the culprit is upstream of this matmul, not us.
+        print(
+            f"[DEBUG-W4A8 apply] prefix={getattr(layer, 'prefix', '?')} "
+            f"x.shape={tuple(x.shape)}",
+            flush=True,
+        )
+        torch.npu.synchronize()
+        print("  S1 entry-sync OK (preceding op clean)", flush=True)
+
         original_dtype = x.dtype
         if original_dtype not in (torch.float16, torch.bfloat16):
             x = x.to(torch.bfloat16)
@@ -562,6 +573,10 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
+
+        # [DEBUG-W4A8] STAGE-2 sync: isolates npu_dynamic_mx_quant from the matmul.
+        torch.npu.synchronize()
+        print("  S2 dynamic-quant-sync OK", flush=True)
 
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
@@ -608,7 +623,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         # leaking out as a misattributed segfault at a later sync point. Remove
         # together with the dump instrumentation once the e2e is fixed.
         torch.npu.synchronize()
-        print("  -> matmul OK", flush=True)
+        print("  S3 matmul-sync OK", flush=True)
 
         # Restore original shape (replace last dim with output features).
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
