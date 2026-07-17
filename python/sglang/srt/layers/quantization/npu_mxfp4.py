@@ -111,15 +111,24 @@ class Mxfp4W4A8Config(QuantizationConfig):
                 "kernel exists yet. Add a device branch here when one lands."
             )
         elif isinstance(layer, FusedMoE):
-            # MoE MXFP4 not yet implemented; fall back to unquantised
-            logger.warning(
-                "MXFP4 W4A8 quantization is not yet supported for FusedMoE layers "
-                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
-                "run in full precision (BF16/FP16).",
+            if is_layer_skipped(
                 prefix,
-            )
-            return UnquantizedFusedMoEMethod(
-                layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                    NPUMXFP4W4A8FusedMoEMethod,
+                )
+
+                return NPUMXFP4W4A8FusedMoEMethod(self)
+            raise NotImplementedError(
+                "mxfp_w4a8 (MXFP4 weights + MXFP8 activations, W4A8) FusedMoE is "
+                "currently only implemented for the Ascend NPU backend; no "
+                "CUDA/other-device kernel exists yet."
             )
         return None
 
