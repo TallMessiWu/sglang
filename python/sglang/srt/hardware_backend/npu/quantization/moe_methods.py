@@ -1064,9 +1064,18 @@ class NPUMXFP4W4A8MoEMethod(_NPUMoEMethodBase):
 
     @staticmethod
     def _process_scale_fp4(scale: torch.Tensor) -> torch.Tensor:
-        """Reshape flat scale [E,N,K//32] to pair-split [E,K//64,N,2]."""
-        n, k = scale.shape[1], scale.shape[2]
-        scale = scale.reshape(scale.shape[0], n, k // 2, 2)
+        """Reshape scale to [E, K//64, N, 2] for grouped matmul.
+
+        The online path from ``npu_dynamic_mx_quant(dst_type=fp4)`` already
+        returns a 4D pair-split scale ``[E, N, K//64, 2]``; the offline
+        checkpoint gives a 3D flat scale ``[E, N, K//32]`` uint8 that still
+        needs the split.
+        """
+        if scale.ndim == 3:
+            # Offline: [E, N, K//32] → [E, N, K//64, 2]
+            n, k = scale.shape[1], scale.shape[2]
+            scale = scale.reshape(scale.shape[0], n, k // 2, 2)
+        # else: online — already 4D [E, N, K//64, 2]
         return scale.transpose(-3, -2)  # [E, K//64, N, 2]
 
     def process_weights_after_loading(
