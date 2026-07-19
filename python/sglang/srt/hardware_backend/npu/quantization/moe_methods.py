@@ -9,17 +9,16 @@ from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
 import logging
 
-from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
-    HiddenStatesDynamicQuant,
+from sglang.srt.hardware_backend.npu.moe.matmul import (
+    GroupedMatmul,
+    GroupedMatmulSwigluQuant,
 )
-from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
+from sglang.srt.hardware_backend.npu.moe.quant import HiddenStatesDynamicQuant
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _get_float8_e8m0fnu_dtype,
 )
@@ -757,17 +756,26 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     (weights already quantised); ``process_weights_after_loading`` tells the two
     apart by weight dtype.
 
-    Unlike the int8/int4 methods this one does not quantise activations itself:
-    the dispatcher's ``npu_moe_init_routing_v2(quant_mode=3)`` emits the e4m3
-    payload and e8m0 scale as part of routing, and gmm1 re-quantises its own
-    output. Consequently gmm1 is a single fused kernel rather than a matmul plus
-    a separate activation, so the runner calls ``apply_fused_gmm1_swiglu`` for
-    w13 and ``apply`` only for w2.
+    gmm1 is a single fused kernel rather than a matmul plus a separate
+    activation, so the runner calls ``apply_fused_gmm1_swiglu`` for w13 and
+    ``apply`` only for w2 — hence the per-prefix matmul chosen here.
+
+    On the ascend_tp path the activation quant comes for free from the
+    dispatcher's ``npu_moe_init_routing_v2(quant_mode=3)``. DeepEP has no mxfp8
+    dispatch, so it hands over bf16 and w13 quantises the hidden states itself
+    before gmm1.
     """
 
-    def __init__(self):
+    def __init__(self, weight_prefix: str):
         super().__init__(quant_config=None)
-        self.matmul = GroupedMatmul()
+        if weight_prefix == "w13":
+            self.matmul = GroupedMatmulSwigluQuant()
+            self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+                quant_dtype=torch.float8_e4m3fn
+            )
+        else:
+            self.matmul = GroupedMatmul()
+            self.hidden_states_quantizer = None
 
     @staticmethod
     def _quantize_weight_online(
@@ -827,14 +835,19 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         )
 
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "mxfp8")
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+
+            # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
+            # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
+            dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
+            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
 
     def apply_fused_gmm1_swiglu(
         self,
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
         group_list_type,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Gate/up projection, swiglu and requantisation in one kernel (gmm1).
@@ -842,15 +855,22 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         Returns the e4m3 activations and their e8m0 block scale, i.e. exactly
         what the w2 gmm needs, which is why the runner skips its activation step
         for MXFP8.
+
+        ``pertoken_scale`` is None when the dispatcher handed over unquantised
+        hidden states (the DeepEP path), in which case the activation quant that
+        ascend_tp fuses into routing is done here instead.
         """
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
         e8m0_dtype = _require_e8m0_dtype()
-        # gmm1 wants a cumulative group_list while gmm2 keeps the COUNT form the
-        # dispatcher produces (group_list_type=1). The asymmetry is intentional.
-        group_list = expert_tokens.cumsum(0) if group_list_type == 1 else expert_tokens
-        return torch.ops.npu.npu_grouped_matmul_swiglu_quant_v2(
-            x=hidden_states,
-            weight=[quant_info.w13_weight],
-            group_list=group_list,
+        return self.matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens,
+            group_list_type=group_list_type,
+            transposed=True,
             weight_scale=[quant_info.w13_weight_scale],
             x_scale=pertoken_scale,
             dequant_mode=2,
@@ -900,95 +920,3 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             transposed=True,
             **scale_args,
         )
-
-
-# ---------------------------------------------------------------------------
-#  NPUMXFP8FusedMoEMethod
-# ---------------------------------------------------------------------------
-class NPUMXFP8FusedMoEMethod(FusedMoEMethodBase):
-    """Online MXFP8 FusedMoE entry point (``--quantization mxfp8`` on A5).
-
-    Owns the BF16 weight placeholders and the runner wiring; the per-gmm work
-    lives in ``NPUMXFP8MoEMethod``, which quantises the weights to MXFP8 at load
-    time. The offline ModelSlim path reuses that same kernel via
-    ``ModelSlimMXFP8MoEScheme`` instead of this class.
-
-    TP only: MoE EP / DeepEP is not supported on this path.
-    """
-
-    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
-        super().__init__()
-        self.quant_config = quant_config
-        self.w13_kernel = NPUMXFP8MoEMethod()
-        self.w2_kernel = NPUMXFP8MoEMethod()
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        from sglang.srt.utils import set_weight_attrs
-
-        # Weights load in params_dtype (BF16/FP16) and are quantised to MXFP8 in
-        # process_weights_after_loading.
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_size,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self.w13_kernel.process_weights_after_loading(layer, "w13")
-        self.w2_kernel.process_weights_after_loading(layer, "w2")
-
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):
-        from sglang.srt.layers.moe.moe_runner import MoeRunner
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
-
-        layer.w13_kernel = self.w13_kernel
-        layer.w2_kernel = self.w2_kernel
-        moe_runner_config.layer = layer
-        self.moe_runner_config = moe_runner_config
-        backend = get_moe_runner_backend()
-        if backend.is_auto():
-            backend = MoeRunnerBackend.ASCEND
-        self.runner = MoeRunner(backend, moe_runner_config)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
-        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-        quant_info = AscendQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_weight_scale=layer.w13_weight_scale,
-            w2_weight_scale=layer.w2_weight_scale,
-        )
-        return self.runner.run(dispatch_output, quant_info)
