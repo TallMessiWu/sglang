@@ -403,10 +403,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.num_local_experts, *new_shape_w2
             )
         if _is_npu:
+            # The kernel sets the dispatcher output dtype itself — it knows what
+            # its gmms expect, which is not always bf16 for subclasses.
             layer.w13_kernel.process_weights_after_loading(layer, "w13")
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
-            if hasattr(layer, "dispatcher"):
-                layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         return
 
