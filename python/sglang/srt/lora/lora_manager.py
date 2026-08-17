@@ -577,6 +577,7 @@ class LoRAManager:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
         else:
             self.experts_shared_outer_loras = self._detect_shared_outer_loras()
+        self._validate_ascend_moe_lora_scope()
         if self.experts_shared_outer_loras:
             logger.info(
                 "Shared outer LoRA mode enabled: gate_up lora_A and "
@@ -586,6 +587,36 @@ class LoRAManager:
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
+
+    def _validate_ascend_moe_lora_scope(self) -> None:
+        if self.lora_backend.name != "ascend" or not all(
+            target in self.target_modules
+            for target in ("gate_up_proj", "down_proj")
+        ):
+            return
+        if not any(
+            isinstance(module, FusedMoE) for module in self.base_model.modules()
+        ):
+            return
+        if self.lora_use_virtual_experts:
+            raise NotImplementedError(
+                "Ascend MoE LoRA MVP does not support --lora-use-virtual-experts."
+            )
+        if self.experts_shared_outer_loras:
+            raise NotImplementedError(
+                "Ascend MoE LoRA MVP does not support shared-outer expert LoRA."
+            )
+
+        config = self.base_hf_config
+        shared_intermediate = getattr(
+            config, "shared_expert_intermediate_size", 0
+        ) or 0
+        shared_expert_count = getattr(config, "n_shared_experts", 0) or 0
+        if shared_intermediate > 0 or shared_expert_count > 0:
+            raise NotImplementedError(
+                "Ascend MoE LoRA MVP does not support models with shared experts; "
+                "use a routed-expert-only Qwen3 MoE model."
+            )
 
     def init_lora_adapters(self, lora_paths: Optional[List[LoRARef]] = None):
         # Configs of all active LoRA adapters, indexed by LoRA ID.

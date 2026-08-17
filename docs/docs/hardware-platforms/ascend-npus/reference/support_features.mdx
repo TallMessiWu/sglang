@@ -1159,6 +1159,20 @@ click [Server Arguments](../../../advanced_features/server_arguments).
 
 ## LoRA (restricted to Qwen series models)
 
+Ascend supports routed-expert MoE LoRA for BF16 Qwen3 models with the
+`ascend` LoRA backend. The initial implementation uses TP with
+`--moe-a2a-backend none` and supports eager execution and NPU Graph. Base-only,
+single-adapter, and multi-adapter requests may share a batch.
+
+The following MoE LoRA combinations fail at startup instead of falling back:
+
+- Expert parallelism and AlltoAll backends such as DeepEP and Ascend FuseEP.
+- Quantized expert weights, including W8A8, MXFP8, and MXFP4.
+- Models with shared experts, shared-outer expert LoRA, or virtual experts.
+
+Keep `--moe-runner-backend auto`; the unquantized NPU MoE layer selects the
+internal Ascend runner automatically.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "16.7%"}} />

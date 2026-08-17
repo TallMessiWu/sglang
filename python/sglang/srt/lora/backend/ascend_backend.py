@@ -175,6 +175,32 @@ class AscendLoRABackend(BaseLoRABackend):
 
         return output_tensor
 
+    def init_cuda_graph_moe_buffers(
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype: torch.dtype,
+        moe_layer,
+    ):
+        """Allocate fixed-shape metadata and BGMV scratch for NPU Graph."""
+        del compute_dtype
+        base_layer = moe_layer.base_layer
+        max_lora_rank = moe_layer.down_lora_a_weights.shape[2]
+        device = base_layer.w13_weight.device
+        self.moe_cg_buffers = {
+            "adapter_enabled": torch.zeros(
+                max_loras, dtype=torch.int32, device=device
+            ),
+            "token_lora_mapping": torch.full(
+                (max_bs,), -1, dtype=torch.int32, device=device
+            ),
+            "ascend_shrink_buffer": torch.empty(
+                (max_bs * base_layer.top_k * 2, max_lora_rank),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
