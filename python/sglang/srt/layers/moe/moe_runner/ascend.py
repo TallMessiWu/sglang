@@ -61,6 +61,8 @@ class AscendRunnerInput(RunnerInput):
     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
     expert_tokens: torch.Tensor
     group_list_type: int  # 0 or 1 (passed to NPU ops)
+    topk_ids: Optional[torch.Tensor] = None
+    expanded_row_idx: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -182,6 +184,9 @@ class AscendRunnerCore(MoeRunnerCore):
                 group_list_type=group_list_type,
             )
 
+            if hooks is not None and hooks.after_gate_up is not None:
+                hooks.after_gate_up(x, hidden_states, None, runner_input.topk_ids)
+
             # --- Activation ---
             # Grouped-row activations require dispatch metadata.
             if isinstance(
@@ -199,15 +204,20 @@ class AscendRunnerCore(MoeRunnerCore):
                 )
 
         # --- w2 (down) projection ---
+        intermediate_states = hidden_states
         hidden_states = self.config.layer.w2_kernel.apply(
             quant_info,
-            hidden_states,
+            intermediate_states,
             expert_tokens,
             pertoken_scale=pertoken_scale,
             output_dtype=original_dtype,
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
+        if hooks is not None and hooks.after_down is not None:
+            hooks.after_down(
+                intermediate_states, hidden_states, None, runner_input.topk_ids
+            )
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 
@@ -247,6 +257,8 @@ def pre_permute_ascend_tp_to_ascend(
         hidden_states_scale=dispatch_output.hidden_states_scale,
         expert_tokens=dispatch_output.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
+        topk_ids=dispatch_output.topk_ids,
+        expanded_row_idx=dispatch_output.expanded_row_idx,
     )
 
 

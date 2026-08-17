@@ -928,6 +928,50 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+def _validate_ascend_moe_lora_layer(base_layer: FusedMoE) -> None:
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+        NPUUnquantMoEMethod,
+    )
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if getattr(base_layer, "moe_ep_size", 1) != 1:
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP supports TP-only execution; EP is not supported."
+        )
+    a2a_backend = get_moe_a2a_backend()
+    if not a2a_backend.is_none():
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP requires --moe-a2a-backend none; "
+            f"'{a2a_backend.value}' is not supported."
+        )
+    if getattr(base_layer, "is_shared_fused_moe", False) or (
+        getattr(base_layer, "num_fused_shared_experts", 0) != 0
+    ):
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP does not support fused shared experts."
+        )
+    if getattr(base_layer, "params_dtype", None) != torch.bfloat16:
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP supports BF16 expert weights only."
+        )
+    if not isinstance(
+        getattr(base_layer, "w13_kernel", None), NPUUnquantMoEMethod
+    ) or not isinstance(getattr(base_layer, "w2_kernel", None), NPUUnquantMoEMethod):
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP supports unquantized expert weights only; "
+            "W8A8, MXFP8, MXFP4, and other quantized MoE kernels are not supported."
+        )
+    config = base_layer.moe_runner_config
+    if not config.is_gated or config.activation != "silu":
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP supports gated SiLU experts only."
+        )
+    if config.gemm1_alpha is not None or config.gemm1_clamp_limit is not None:
+        raise NotImplementedError(
+            "Ascend MoE LoRA MVP does not support interleaved/clamped W13 output."
+        )
+
+
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
     """
     Wrapper around FusedMoE that integrates LoRA into the MoE computation.
@@ -991,6 +1035,23 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
+        base_runner = getattr(base_layer.quant_method, "runner", None)
+        base_runner_backend = getattr(base_runner, "runner_backend", None)
+        if (
+            base_runner_backend is not None
+            and base_runner_backend.is_ascend()
+            and not runner_backend.is_ascend()
+        ):
+            raise NotImplementedError(
+                "Ascend MoE LoRA requires --moe-runner-backend auto."
+            )
+        if runner_backend.is_ascend():
+            if lora_backend.name != "ascend":
+                raise NotImplementedError(
+                    "Ascend MoE LoRA requires --lora-backend ascend."
+                )
+            _validate_ascend_moe_lora_layer(base_layer)
+
         # Unquantized layers have no marlin-repacked weights, so run their LoRA
         # on Triton. Inkling shared experts use InklingBatchDenseMLP directly
         # and never reach this wrapper.
@@ -1045,6 +1106,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        elif runner_backend.is_ascend():
+            # The ordinary NPU unquantized path passes the FusedMoE layer as
+            # quant_info; its w13/w2 weights are read directly by the kernels.
+            self._quant_info = base_layer
         else:
             raise NotImplementedError(
                 f"LoRA MoE not supported for backend {runner_backend}"

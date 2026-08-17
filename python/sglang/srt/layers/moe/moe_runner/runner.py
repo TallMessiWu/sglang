@@ -152,6 +152,17 @@ class MoeRunner:
             from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
+            if (
+                self.lora_enabled
+                and lora_info is not None
+                and self.runner_backend.is_ascend()
+            ):
+                from sglang.srt.hardware_backend.npu.moe.lora import (
+                    build_ascend_moe_lora_hooks,
+                )
+
+                return build_ascend_moe_lora_hooks(_runner_input, lora_info)
+
             if isinstance(_runner_input, DispatchOutput):
                 hidden_states, topk_ids = (
                     _runner_input.hidden_states,
