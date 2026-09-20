@@ -200,6 +200,45 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        # --- AscendC prefill switch (patch_gdn_prefill_ascendc.py) ---
+        # #747 flipped the pool, the decode kernel and the verify operator to
+        # (nv, dv, dk); the triton path here still returns (nv, dk, dv), so the
+        # state written back to the pool is transposed. Use the operator #747
+        # added, which is native to the unified layout.
+        if is_npu():
+            import torch as _torch
+
+            _op = getattr(_torch.ops.npu, "chunk_gated_delta_rule", None)
+            if _op is None:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "chunk_gated_delta_rule is not registered; falling back to the "
+                    "triton prefill, whose state layout does not match the pool."
+                )
+            else:
+                from sgl_kernel_npu.fla.l2norm import l2norm_fwd as _l2norm
+
+                # q/k/v are strided views carved out of mixed_qkv, so squeezing
+                # leaves a row stride the kernels' view() calls reject.
+                _q = _l2norm(q.squeeze(0).contiguous())
+                _k = _l2norm(k.squeeze(0).contiguous())
+                _lens = _torch.diff(query_start_loc).to(_torch.int32)
+                _out, _state = _op(
+                    _q.contiguous(),
+                    _k.contiguous(),
+                    v.squeeze(0).contiguous(),
+                    beta=beta.squeeze(0).contiguous(),
+                    initial_state=recurrent_state,
+                    actual_seq_lengths=_lens,
+                    scale=q.shape[-1] ** -0.5,
+                    g=g.squeeze(0).to(_torch.float32).contiguous(),
+                )
+                # h (per-chunk states) is only consumed by the mamba page
+                # tracking, which skips on None.
+                return _out.unsqueeze(0), _state, None
+        # --- end switch ---
+
         return chunk_gated_delta_rule(
             q=q,
             k=k,
