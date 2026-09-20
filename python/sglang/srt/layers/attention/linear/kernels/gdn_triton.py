@@ -203,7 +203,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
         # --- AscendC prefill switch (patch_gdn_prefill_ascendc.py) ---
         # #747 flipped the pool, the decode kernel and the verify operator to
         # (nv, dv, dk); the triton path here still returns (nv, dk, dv), so the
-        # state written back to the pool is transposed. Use the operator #747
+        # state written back to the pool is transposed -- silently, because
+        # dk == dv == 128 makes the shapes identical. Use the operator #747
         # added, which is native to the unified layout.
         if is_npu():
             import torch as _torch
@@ -219,24 +220,38 @@ class TritonGDNKernel(LinearAttnKernelBase):
             else:
                 from sgl_kernel_npu.fla.l2norm import l2norm_fwd as _l2norm
 
-                # q/k/v are strided views carved out of mixed_qkv, so squeezing
-                # leaves a row stride the kernels' view() calls reject.
-                _q = _l2norm(q.squeeze(0).contiguous())
-                _k = _l2norm(k.squeeze(0).contiguous())
+                _t, _nk, _dk = q.shape[-3], q.shape[-2], q.shape[-1]
+                _nv, _dv = v.shape[-2], v.shape[-1]
+                # q/k/v arrive as strided views of mixed_qkv, so one reshape each
+                # is the copy the operator needs; l2norm_fwd returns contiguous.
+                _q = _l2norm(q.reshape(-1, _dk)).view(_t, _nk, _dk)
+                _k = _l2norm(k.reshape(-1, _dk)).view(_t, _nk, _dk)
                 _lens = _torch.diff(query_start_loc).to(_torch.int32)
+                # The operator's chunk grid is sum_b ceil(len_b / 64), the same
+                # grid _init_track_ssm_indices builds for GDN, and it writes each
+                # chunk's entering state -- so chunk_state is exactly the `h` the
+                # mamba page tracking reads. Sizing it costs one host sync.
+                _chunks = int(((_lens + 63) // 64).sum())
+                _h = _torch.empty(
+                    _chunks,
+                    _nv,
+                    _dv,
+                    _dk,
+                    dtype=recurrent_state.dtype,
+                    device=recurrent_state.device,
+                )
                 _out, _state = _op(
-                    _q.contiguous(),
-                    _k.contiguous(),
-                    v.squeeze(0).contiguous(),
-                    beta=beta.squeeze(0).contiguous(),
+                    _q,
+                    _k,
+                    v.reshape(_t, _nv, _dv),
+                    beta=beta.reshape(_t, _nv),
                     initial_state=recurrent_state,
                     actual_seq_lengths=_lens,
-                    scale=q.shape[-1] ** -0.5,
-                    g=g.squeeze(0).to(_torch.float32).contiguous(),
+                    scale=_dk**-0.5,
+                    g=g.reshape(_t, _nv).to(_torch.float32),
+                    chunk_state=_h,
                 )
-                # h (per-chunk states) is only consumed by the mamba page
-                # tracking, which skips on None.
-                return _out.unsqueeze(0), _state, None
+                return _out.unsqueeze(0), _state, _h.unsqueeze(0)
         # --- end switch ---
 
         return chunk_gated_delta_rule(
