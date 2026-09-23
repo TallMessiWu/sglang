@@ -21,6 +21,12 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
+# torch.ops.npu.cache_loc_{assign,update} size their own view of out_cache_loc as
+# batch * MAX_STEP int32 and ignore the tensor, so the buffer has to cover it.
+# Keep in sync with MAX_STEP in sgl-kernel-npu
+# csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h.
+_NPU_CACHE_LOC_MAX_STEP = 16
+
 if _is_cpu:
     from sgl_kernel import assign_extend_cache_locs_cpu
 
@@ -508,8 +514,13 @@ def assign_extend_cache_locs_func(
         return out_cache_loc
 
     elif _is_npu:
+        # The overrun is silent -- the operator stores back what it read -- until
+        # the tensor lands in the last block of an allocator segment whose
+        # neighbour is unmapped, which faults as a vector core exception naming
+        # nothing. Results are packed at the front, so the prefix is the answer.
+        # Drop once the operator sizes itself from the tensor it was handed.
         out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
+            (batch_size * max(draft_token_num, _NPU_CACHE_LOC_MAX_STEP),),
             dtype=torch.int32,
             device=device,
         )
@@ -521,7 +532,7 @@ def assign_extend_cache_locs_func(
             out_cache_loc,
         )
 
-        return out_cache_loc
+        return out_cache_loc[: batch_size * draft_token_num]
 
     elif _is_cpu:
         out_cache_loc = torch.empty(
