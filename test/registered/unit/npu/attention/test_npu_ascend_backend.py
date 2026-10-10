@@ -411,7 +411,6 @@ class TestFiaMixedSplitForward(unittest.TestCase):
         self.assertTrue(torch.equal(output, single_output.view(5, 8)))
 
 
-
 class TestGenerateMaskFlag(unittest.TestCase):
     def test_shape(self):
         mask = AscendAttnMaskBuilder.generate_mask_flag(8)
