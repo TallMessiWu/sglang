@@ -37,6 +37,11 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     # for the FLF2V model
     "img_emb.emb_pos": "condition_embedder.image_embedder.pos_embed",
     # Add attention component mappings
+    # Match rotation and metadata before the projection's `self_attn.q` prefix.
+    "self_attn.q_rot": "attn1.q_rot",
+    "self_attn.k_rot": "attn1.k_rot",
+    "self_attn.quant_type": "attn1.quant_type",
+    "cross_attn.quant_type": "attn2.quant_type",
     "self_attn.q": "attn1.to_q",
     "self_attn.k": "attn1.to_k",
     "self_attn.v": "attn1.to_v",
@@ -130,15 +135,14 @@ def convert_transformer(
     with open(json_candidates[0]) as f:
         quant_config = json.load(f)
 
-    for key in list(state_dict.keys()):
-        new_key = key[:]
-        for replace_key, rename_key in RENAME_DICT.items():
-            new_key = new_key.replace(replace_key, rename_key)
-        if new_key != key:
-            update_dict_(state_dict, key, new_key)
-            # The quant JSON only covers quantized layers, not all model keys
-            if key in quant_config:
-                update_dict_(quant_config, key, new_key)
+    # Quantization metadata can also contain keys without a corresponding tensor.
+    for mapping in (state_dict, quant_config):
+        for key in list(mapping):
+            new_key = key
+            for replace_key, rename_key in RENAME_DICT.items():
+                new_key = new_key.replace(replace_key, rename_key)
+            if new_key != key:
+                update_dict_(mapping, key, new_key)
 
     save_file(state_dict, out_path / "diffusion_pytorch_model.safetensors")
 
@@ -158,6 +162,14 @@ def repack(
       2. For each transformer: convert quant weights and copy config.json from original.
     """
     transformer_dirs = get_transformer_dirs(model_type)
+
+    # Reject an incomplete template before copying components or writing weights.
+    required_configs = [original_model_path / "model_index.json"] + [
+        original_model_path / tdir / "config.json" for tdir in transformer_dirs
+    ]
+    for config in required_configs:
+        if not config.is_file():
+            raise FileNotFoundError(f"Missing Diffusers template config: {config}")
 
     # Step 1: Copy original model, skipping transformer dirs (they will be replaced)
     logger.debug(f"Step 1: Copying original model to {output_path}")
@@ -179,9 +191,8 @@ def repack(
 
         # Copy config.json from the original transformer dir
         src_config = original_model_path / tdir / "config.json"
-        if src_config.is_file():
-            shutil.copy2(str(src_config), str(out_tdir / "config.json"))
-            logger.debug(f"  Copied config.json from original {tdir}/")
+        shutil.copy2(str(src_config), str(out_tdir / "config.json"))
+        logger.debug(f"  Copied config.json from original {tdir}/")
 
     logger.info(f"\nDone! Repacked model saved to: {output_path}")
 
