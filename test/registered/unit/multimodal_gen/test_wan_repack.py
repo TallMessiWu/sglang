@@ -1,9 +1,12 @@
 """CPU file-format regressions for ModelSlim Wan repacking."""
 
 import json
+import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -164,6 +167,97 @@ class TestWanRepack(unittest.TestCase):
                 self.write_quant(root / "quant")
                 with self.assertRaisesRegex(FileNotFoundError, missing):
                     repack("Wan2.2-TI2V-5B", original, root / "quant", root / "out")
+                self.assertFalse((root / "out").exists())
+
+    def write_ambiguous_quant(self, directory):
+        tensors, description = self.write_quant(directory)
+        alternative = {
+            key: "FLOAT" if key.endswith(".weight") else value
+            for key, value in description.items()
+        }
+        (directory / "quant_model_description_w8a8_fp8_only.json").write_text(
+            json.dumps(alternative)
+        )
+        return tensors, description
+
+    def test_multiple_descriptions_require_selection_before_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_ambiguous_quant(root / "quant")
+            with self.assertRaisesRegex(ValueError, "--quant-description-file"):
+                convert_transformer("Wan2.2-TI2V-5B", root / "quant", root / "out")
+            self.assertFalse((root / "out").exists())
+
+    def test_cli_selects_description_for_each_expert(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = root / "original"
+            original.mkdir()
+            (original / "model_index.json").write_text("{}")
+            for index, (expert, component) in enumerate(
+                (
+                    ("high_noise_model", "transformer"),
+                    ("low_noise_model", "transformer_2"),
+                )
+            ):
+                _, description = self.write_ambiguous_quant(root / "quant" / expert)
+                # Distinct metadata proves each expert uses its own selected file.
+                description["expert"] = index
+                (
+                    root / "quant" / expert / "quant_model_description_w8a8_mxfp8.json"
+                ).write_text(json.dumps(description))
+                (original / component).mkdir()
+                (original / component / "config.json").write_text("{}")
+            tool = sys.modules[convert_transformer.__module__].__file__
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    tool,
+                    "--model-type",
+                    "Wan2.2-I2V-A14B",
+                    "--original-model-path",
+                    str(original),
+                    "--quant-path",
+                    str(root / "quant"),
+                    "--output-path",
+                    str(root / "out"),
+                    "--quant-description-file",
+                    "quant_model_description_w8a8_mxfp8.json",
+                ],
+            ):
+                runpy.run_path(tool, run_name="__main__")
+            for index, component in enumerate(("transformer", "transformer_2")):
+                description = json.loads(
+                    (
+                        root / "out" / component / "quant_model_description.json"
+                    ).read_text()
+                )
+                self.assertEqual(
+                    description["blocks.0.attn1.to_q.weight"], "W8A8_MXFP8"
+                )
+                self.assertEqual(description["expert"], index)
+
+    def test_description_selection_errors_before_copying_template(self):
+        for selection in (None, "missing.json", "../outside.json"):
+            with (
+                self.subTest(selection=selection),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                original = root / "original"
+                (original / "transformer").mkdir(parents=True)
+                (original / "model_index.json").write_text("{}")
+                (original / "transformer/config.json").write_text("{}")
+                self.write_ambiguous_quant(root / "quant")
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    repack(
+                        "Wan2.2-TI2V-5B",
+                        original,
+                        root / "quant",
+                        root / "out",
+                        quant_description_file=selection,
+                    )
                 self.assertFalse((root / "out").exists())
 
 

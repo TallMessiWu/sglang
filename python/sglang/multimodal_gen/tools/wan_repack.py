@@ -116,24 +116,49 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     return state_dict
 
 
+def resolve_quant_description(
+    directory: pathlib.Path, filename: str | None = None
+) -> pathlib.Path:
+    if filename is not None:
+        if not filename or pathlib.Path(filename).name != filename:
+            raise ValueError("--quant-description-file must be a filename, not a path")
+        path = directory / filename
+        if not path.is_file():
+            raise FileNotFoundError(f"Quantization description not found: {path}")
+        return path
+
+    candidates = sorted(directory.glob("quant_model_description*.json"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No quant_model_description*.json found in {directory}"
+        )
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Multiple quantization descriptions in {directory}: "
+            f"{[path.name for path in candidates]}. "
+            "Select one with --quant-description-file."
+        )
+    return candidates[0]
+
+
 def convert_transformer(
-    model_type: str, model_dir: pathlib.Path, output_dir: pathlib.Path
+    model_type: str,
+    model_dir: pathlib.Path,
+    output_dir: pathlib.Path,
+    quant_description_file: str | None = None,
 ) -> None:
     """Convert a single quantized transformer directory into Diffusers format."""
     model_path = pathlib.Path(model_dir)
     out_path = pathlib.Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
     RENAME_DICT = get_transformer_config(model_type)
 
-    state_dict = load_sharded_safetensors(model_path, "quant_model_weight*.safetensors")
-
-    json_candidates = sorted(model_path.glob("quant_model_description*.json"))
-    if not json_candidates:
-        raise FileNotFoundError(
-            f"No quant_model_description*.json found in {model_path}"
-        )
-    with open(json_candidates[0]) as f:
+    description = resolve_quant_description(model_path, quant_description_file)
+    logger.info("Using quantization description: %s", description)
+    with open(description) as f:
         quant_config = json.load(f)
+
+    state_dict = load_sharded_safetensors(model_path, "quant_model_weight*.safetensors")
+    out_path.mkdir(parents=True, exist_ok=True)
 
     # Quantization metadata can also contain keys without a corresponding tensor.
     for mapping in (state_dict, quant_config):
@@ -155,6 +180,7 @@ def repack(
     original_model_path: pathlib.Path,
     quant_path: pathlib.Path,
     output_path: pathlib.Path,
+    quant_description_file: str | None = None,
 ) -> None:
     """
     Full one-step repack workflow:
@@ -170,6 +196,12 @@ def repack(
     for config in required_configs:
         if not config.is_file():
             raise FileNotFoundError(f"Missing Diffusers template config: {config}")
+
+    # Check every expert before copying large components or converting either one.
+    for tdir in transformer_dirs:
+        resolve_quant_description(
+            get_quant_subpath(model_type, quant_path, tdir), quant_description_file
+        )
 
     # Step 1: Copy original model, skipping transformer dirs (they will be replaced)
     logger.debug(f"Step 1: Copying original model to {output_path}")
@@ -187,7 +219,7 @@ def repack(
         logger.debug(
             f"\nStep {i + 2}: Converting {tdir} (quant source: {q_path.name})..."
         )
-        convert_transformer(model_type, q_path, out_tdir)
+        convert_transformer(model_type, q_path, out_tdir, quant_description_file)
 
         # Copy config.json from the original transformer dir
         src_config = original_model_path / tdir / "config.json"
@@ -221,6 +253,15 @@ def get_args():
         help="Path to msmodelslim quantized weights directory",
     )
     parser.add_argument(
+        "--quant-description-file",
+        type=str,
+        help=(
+            "Description filename within each quantized transformer directory "
+            "(e.g., quant_model_description_w8a8_mxfp8.json). "
+            "Required when multiple quant_model_description*.json files exist."
+        ),
+    )
+    parser.add_argument(
         "--output-path",
         type=str,
         required=True,
@@ -236,4 +277,5 @@ if __name__ == "__main__":
         original_model_path=pathlib.Path(args.original_model_path),
         quant_path=pathlib.Path(args.quant_path),
         output_path=pathlib.Path(args.output_path),
+        quant_description_file=args.quant_description_file,
     )
