@@ -34,6 +34,7 @@ class AscendTPDispatchOutput(NamedTuple):
     expanded_row_idx: torch.Tensor
     expert_tokens: torch.Tensor
     group_list_type: int
+    original_dtype: Optional[torch.dtype] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -122,6 +123,7 @@ class AscendTPDispatcher(BaseDispatcher):
             expanded_row_idx=expanded_row_idx,
             expert_tokens=expert_tokens,
             group_list_type=self.group_list_type,
+            original_dtype=hidden_states.dtype,
         )
         return self._dispatch_output
 
