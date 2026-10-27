@@ -94,6 +94,7 @@ class AscendRunnerInput(RunnerInput):
     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
     expert_tokens: torch.Tensor
     group_list_type: int  # 0 or 1 (passed to NPU ops)
+    original_dtype: Optional[torch.dtype] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -215,7 +216,13 @@ class AscendRunnerCore(MoeRunnerCore):
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
         x = runner_input.hidden_states
-        original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+        # Routing may have replaced the payload with FP8. Keep the source
+        # dtype for gmm2 rather than silently turning FP16 output into BF16.
+        original_dtype = runner_input.original_dtype
+        if original_dtype is None:
+            original_dtype = (
+                torch.float16 if x.dtype == torch.float16 else torch.bfloat16
+            )
         expert_tokens = runner_input.expert_tokens
         group_list_type = runner_input.group_list_type
 
@@ -314,6 +321,7 @@ def pre_permute_ascend_tp_to_ascend(
         hidden_states_scale=dispatch_output.hidden_states_scale,
         expert_tokens=dispatch_output.expert_tokens,
         group_list_type=dispatch_output.group_list_type,
+        original_dtype=dispatch_output.original_dtype,
     )
 
 
