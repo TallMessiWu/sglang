@@ -368,13 +368,13 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
                 weight_scale.dtype,
             )
 
-        # A5 DeepEP low-latency dispatch quantizes the valid received rows to
-        # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
-        # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
-        # preserves multi-node prefill when ``deepep-mode=auto``.
+        # Ascend TP fuses MXFP8 activation quantization into routing. Preserve
+        # DeepEP's mode-specific contracts: normal stays BF16 for multi-node
+        # prefill, while low-latency returns MXFP8 with E8M0 block scales.
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(
                 {
+                    "dispatcher_output_dtype": "mxfp8",
                     "normal_dispatcher_output_dtype": "bf16",
                     "low_latency_dispatcher_output_dtype": "mxfp8",
                 }
@@ -424,8 +424,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         weight dtype and the e8m0 weight_scale. Returns (e4m3 activations,
         e8m0 block scale) ready for the w2 gmm.
 
-        The dispatcher hands over BF16 (see process_weights_after_loading), so
-        pertoken_scale is normally None and the activation quant happens here.
+        Ascend TP and DeepEP low-latency supply quantized activations and
+        scales. DeepEP normal supplies BF16 and needs activation quant here.
         """
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
         if fp4_dtype is None:
