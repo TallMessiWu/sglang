@@ -812,6 +812,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if (
+            _is_npu
+            and not get_forward().sp_active
+            and not (get_lora().enable_lora or get_lora().lora_paths)
+        ):
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                NPUMXFP4W4A8LinearMethod,
+            )
+
+            if (
+                type(self.in_proj_qkvz.quant_method) is NPUMXFP4W4A8LinearMethod
+                and type(self.in_proj_ba.quant_method) is NPUMXFP4W4A8LinearMethod
+            ):
+                # Both column projections consume the same full-K input. Keep
+                # their module calls, weights and output dtypes independent;
+                # only share this forward's FP8 payload and block scales.
+                prepared = self.in_proj_qkvz.quant_method.prepare_input(hidden_states)
+                return self.in_proj_qkvz(prepared)[0], self.in_proj_ba(prepared)[0]
+
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
