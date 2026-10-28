@@ -48,6 +48,10 @@ from sglang.benchmark.goodput import (
     calculate_goodput,
     print_goodput,
 )
+from sglang.benchmark.stall_trace import (
+    gather_with_stall_trace,
+    stall_trace_details,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -114,6 +118,8 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    stream_gaps: List[Tuple[float, float, int]] = field(default_factory=list)
+    first_token_time: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -786,6 +792,7 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    output.first_token_time = timestamp
 
                                 # Decoding phase
                                 else:
@@ -793,6 +800,17 @@ async def async_request_sglang_generate(
                                     if num_new_tokens == 0:
                                         continue
                                     chunk_gap = timestamp - most_recent_timestamp
+                                    if (
+                                        getattr(args, "trace_stalls", False)
+                                        and chunk_gap > 0.5
+                                    ):
+                                        output.stream_gaps.append(
+                                            (
+                                                most_recent_timestamp,
+                                                timestamp,
+                                                num_new_tokens,
+                                            )
+                                        )
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
 
@@ -1616,7 +1634,9 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs, client_loop_lags = await gather_with_stall_trace(
+        tasks, getattr(args, "trace_stalls", False)
+    )
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1950,6 +1970,13 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if getattr(args, "trace_stalls", False):
+        result_details["stall_trace"] = stall_trace_details(
+            outputs,
+            benchmark_start_time,
+            benchmark_start_time + benchmark_duration,
+            client_loop_lags,
+        )
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]
@@ -1982,10 +2009,17 @@ def set_global_args(args_: argparse.Namespace):
     global args
     args = args_
 
+    if getattr(args, "trace_stalls", False):
+        if args.backend != "sglang" or getattr(args, "rust_client", False):
+            raise ValueError("--trace-stalls requires the native Python sglang client")
+        if getattr(args, "disable_stream", False):
+            raise ValueError("--trace-stalls requires streaming responses")
+        args.output_details = True
+
 
 def run_benchmark(args_: argparse.Namespace):
     global args
-    args = args_
+    set_global_args(args_)
 
     # The Rust client owns the whole run, from dataset to result file, so hand
     # it the arguments before this module sets up anything of its own.
@@ -2490,6 +2524,12 @@ def cli_main():
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
+    )
+    parser.add_argument(
+        "--trace-stalls",
+        action="store_true",
+        help="Diagnose native sglang stream gaps and client loop lag; implies --output-details. "
+        "Adds instrumentation: do not use this run for performance acceptance.",
     )
     parser.add_argument(
         "--goodput",

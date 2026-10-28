@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -34,7 +35,7 @@ def make_pool(dtype=torch.bfloat16, strided=False, empty_temporal=False):
 
 
 class TestNPUMambaClear(unittest.TestCase):
-    def run_clear(self, pool, indices, enabled=True, is_npu=True):
+    def run_clear(self, pool, indices, enabled=True, is_npu=True, trace=False):
         copies, fills = [], []
         original_copy = torch.Tensor.index_copy_
         original_fill = torch.Tensor.index_fill_
@@ -48,7 +49,13 @@ class TestNPUMambaClear(unittest.TestCase):
             return original_fill(tensor, dim, index, value)
 
         with (
-            patch.dict(os.environ, {OPTION: "1" if enabled else "0"}),
+            patch.dict(
+                os.environ,
+                {
+                    OPTION: "1" if enabled else "0",
+                    "SGLANG_NPU_MAMBA_CLEAR_TRACE": "1" if trace else "0",
+                },
+            ),
             patch.object(memory_pool, "_is_npu", is_npu),
             patch.object(torch.Tensor, "index_copy_", index_copy),
             patch.object(torch.Tensor, "index_fill_", index_fill),
@@ -134,6 +141,54 @@ class TestNPUMambaClear(unittest.TestCase):
         )
         fresh, _, _ = make_pool()
         self.assertEqual(self.run_clear(fresh, torch.tensor([1]), enabled=False)[0], [])
+
+    def test_trace_records_allocator_counters_without_synchronizing(self):
+        from sglang.srt.mem_cache import npu_mamba_clear_trace as trace_module
+
+        pool, states, _ = make_pool()
+        snapshots = iter({"num_alloc_retries": n} for n in (1, 2, 2, 2, 2, 2))
+        npu = SimpleNamespace(
+            memory_stats=Mock(side_effect=lambda _: next(snapshots)), synchronize=Mock()
+        )
+        with (
+            patch.object(torch, "npu", npu, create=True),
+            patch.object(trace_module.logger, "info") as log,
+        ):
+            self.run_clear(pool, torch.tensor([2, 5]), trace=True)
+        npu.synchronize.assert_not_called()
+        self.assertEqual(npu.memory_stats.call_count, 6)
+        self.assertEqual(log.call_count, 3)
+        for state, call in zip(states, log.call_args_list):
+            row = json.loads(call.args[1])
+            self.assertEqual(row["slots"], 2)
+            self.assertEqual(
+                row["zero_bytes"], state.numel() // 7 * 2 * state.element_size()
+            )
+            self.assertLessEqual(row["started"], row["allocation_ended"])
+            self.assertLessEqual(row["allocation_ended"], row["ended"])
+        first = json.loads(log.call_args_list[0].args[1])
+        self.assertEqual(
+            first["after"]["num_alloc_retries"] - first["before"]["num_alloc_retries"],
+            1,
+        )
+
+    def test_unavailable_stats_do_not_change_clear_or_hide_operator_errors(self):
+        from sglang.srt.mem_cache import npu_mamba_clear_trace as trace_module
+
+        pool, states, _ = make_pool()
+        npu = SimpleNamespace(
+            memory_stats=Mock(side_effect=RuntimeError("private-details"))
+        )
+        with (
+            patch.object(torch, "npu", npu, create=True),
+            patch.object(trace_module.logger, "info") as log,
+        ):
+            self.run_clear(pool, torch.tensor([1]), trace=True)
+            with self.assertRaisesRegex(ValueError, "operator error"):
+                with trace_module.trace_clear(states[0], torch.tensor([1]), True):
+                    raise ValueError("operator error")
+        self.assertNotIn("private-details", str(log.call_args_list))
+        self.assertTrue(torch.equal(states[0][:, 1], torch.zeros_like(states[0][:, 1])))
 
     def test_cuda_fused_conv_dispatch_and_sibling_reset_are_preserved(self):
         pool, states, _ = make_pool()

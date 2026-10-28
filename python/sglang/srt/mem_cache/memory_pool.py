@@ -1147,20 +1147,35 @@ class MambaPool:
     def _use_npu_index_copy_clear(self) -> bool:
         return _is_npu and envs.SGLANG_NPU_MAMBA_CLEAR_USE_INDEX_COPY.get()
 
+    @cached_property
+    def _trace_npu_mamba_clear(self) -> bool:
+        return _is_npu and envs.SGLANG_NPU_MAMBA_CLEAR_TRACE.get()
+
     def _clear_state_slots(self, state: torch.Tensor, indices: torch.Tensor):
         if state.numel() == 0 or indices.numel() == 0:
             return
-        if (
+        use_index_copy = (
             self._use_npu_index_copy_clear
             and state.dtype == torch.bfloat16
             and state.is_contiguous()
-        ):
-            # NPU index_fill_ can scale with the entire pool. Allocate zeros
-            # only for selected slots, preserving every other live state.
-            zeros = state.new_zeros((state.shape[0], indices.numel(), *state.shape[2:]))
-            state.index_copy_(1, indices, zeros)
-        else:
-            state.index_fill_(1, indices, 0)
+        )
+        context = nullcontext()
+        if self._trace_npu_mamba_clear:
+            from sglang.srt.mem_cache.npu_mamba_clear_trace import trace_clear
+
+            context = trace_clear(state, indices, use_index_copy)
+        with context as trace:
+            if use_index_copy:
+                # NPU index_fill_ can scale with the entire pool. Allocate zeros
+                # only for selected slots, preserving every other live state.
+                zeros = state.new_zeros(
+                    (state.shape[0], indices.numel(), *state.shape[2:])
+                )
+                if trace is not None:
+                    trace["allocation_ended"] = time.perf_counter()
+                state.index_copy_(1, indices, zeros)
+            else:
+                state.index_fill_(1, indices, 0)
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""

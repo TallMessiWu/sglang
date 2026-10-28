@@ -1546,9 +1546,11 @@ class Envs:
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
-    # Clear contiguous BF16 NPU states with selected-slot zero sources.
-    # Set to false before startup to restore index_fill_ for comparison.
-    SGLANG_NPU_MAMBA_CLEAR_USE_INDEX_COPY = EnvBool(True)
+    # Opt-in selected-slot zero sources for contiguous BF16 NPU states.
+    # Keep index_fill_ as the default pending serving-tail validation.
+    SGLANG_NPU_MAMBA_CLEAR_USE_INDEX_COPY = EnvBool(False)
+    # Diagnostic-only host spans/allocator counters; no device synchronization.
+    SGLANG_NPU_MAMBA_CLEAR_TRACE = EnvBool(False)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
