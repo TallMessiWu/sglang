@@ -1143,6 +1143,25 @@ class MambaPool:
             (time.perf_counter() - started) * 1000,
         )
 
+    @cached_property
+    def _use_npu_index_copy_clear(self) -> bool:
+        return _is_npu and envs.SGLANG_NPU_MAMBA_CLEAR_USE_INDEX_COPY.get()
+
+    def _clear_state_slots(self, state: torch.Tensor, indices: torch.Tensor):
+        if state.numel() == 0 or indices.numel() == 0:
+            return
+        if (
+            self._use_npu_index_copy_clear
+            and state.dtype == torch.bfloat16
+            and state.is_contiguous()
+        ):
+            # NPU index_fill_ can scale with the entire pool. Allocate zeros
+            # only for selected slots, preserving every other live state.
+            zeros = state.new_zeros((state.shape[0], indices.numel(), *state.shape[2:]))
+            state.index_copy_(1, indices, zeros)
+        else:
+            state.index_fill_(1, indices, 0)
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         for sibling in self._slot_siblings:
@@ -1154,10 +1173,10 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, idx64)
         else:
             for conv in self.mamba_cache.conv:
-                conv.index_fill_(1, idx64, 0)
+                self._clear_state_slots(conv, idx64)
         temporal = self.mamba_cache.temporal
         if temporal.numel() > 0:
-            temporal.index_fill_(1, idx64, 0)
+            self._clear_state_slots(temporal, idx64)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
