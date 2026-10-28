@@ -1062,6 +1062,9 @@ class Envs:
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
+    # W4A8 ordinary TP: set to 0 to quantize after routing. Resolved at load time;
+    # DeepEP normal/low-latency dispatch contracts remain independent.
+    SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
