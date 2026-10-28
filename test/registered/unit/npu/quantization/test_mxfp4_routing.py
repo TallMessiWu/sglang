@@ -1,6 +1,7 @@
 """CPU contracts for MXFP4 weights with routing-fused MXFP8 activations."""
 
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,9 +25,9 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestMXFP4Routing(unittest.TestCase):
     def test_online_and_offline_routing_reuse_scales_and_preserve_dtype(self):
-        for online in (False, True):
+        for online, fuse_routing in product((False, True), repeat=2):
             for dtype in (torch.bfloat16, torch.float16):
-                with self.subTest(online=online, dtype=dtype):
+                with self.subTest(online=online, dtype=dtype, fused=fuse_routing):
                     layer = torch.nn.Module()
                     layer.w13_kernel = moe_methods.NPUW4A8MXFP4MoEMethod()
                     layer.w2_kernel = moe_methods.NPUW4A8MXFP4MoEMethod()
@@ -52,6 +53,11 @@ class TestMXFP4Routing(unittest.TestCase):
                     )
                     with (
                         patch.object(
+                            moe_methods.envs.SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT,
+                            "get",
+                            return_value=fuse_routing,
+                        ),
+                        patch.object(
                             moe_methods, "_get_float4_e2m1fn_x2_dtype", return_value=296
                         ),
                         patch.object(
@@ -68,8 +74,23 @@ class TestMXFP4Routing(unittest.TestCase):
                     ):
                         layer.w13_kernel.process_weights_after_loading(layer, "w13")
 
-                        routed_x = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
-                        routed_scale = torch.ones(4, 2, dtype=torch.uint8)
+                        quantized_x = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
+                        quantized_scale = torch.ones(4, 1, 2, dtype=torch.uint8)
+                        routed_x = (
+                            quantized_x
+                            if fuse_routing
+                            else torch.zeros(4, 64, dtype=dtype)
+                        )
+                        routed_scale = (
+                            quantized_scale.flatten(-2) if fuse_routing else None
+                        )
+                        quant_config = layer.dispatcher.quant_config
+                        self.assertEqual(
+                            quant_config["normal_dispatcher_output_dtype"], "bf16"
+                        )
+                        self.assertEqual(
+                            quant_config["low_latency_dispatcher_output_dtype"], "mxfp8"
+                        )
                         counts = torch.tensor([2, 2], dtype=torch.int64)
                         gmm1_out = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
                         gmm1_scale = torch.full((4, 1, 2), 2, dtype=torch.uint8)
@@ -88,11 +109,9 @@ class TestMXFP4Routing(unittest.TestCase):
                             patch.object(
                                 torch.ops.npu,
                                 "npu_dynamic_mx_quant",
-                                side_effect=AssertionError(
-                                    "Repeated activation quantization"
-                                ),
+                                return_value=(quantized_x, quantized_scale),
                                 create=True,
-                            ),
+                            ) as quantize,
                             patch.object(
                                 torch.ops.npu,
                                 "npu_grouped_matmul_swiglu_quant_v2",
@@ -116,7 +135,10 @@ class TestMXFP4Routing(unittest.TestCase):
                                     None,
                                 ),
                             )
-                            self.assertEqual(routing.call_args.kwargs["quant_mode"], 3)
+                            self.assertEqual(
+                                routing.call_args.kwargs["quant_mode"],
+                                3 if fuse_routing else -1,
+                            )
                             runner_input = pre_permute_ascend_tp_to_ascend(
                                 dispatch_out, layer, config, {}
                             )
@@ -125,12 +147,19 @@ class TestMXFP4Routing(unittest.TestCase):
                             result = runner.run(runner_input, layer, {})
 
                         self.assertEqual(result.hidden_states.dtype, dtype)
+                        self.assertEqual(quantize.call_count, 0 if fuse_routing else 1)
+                        if not fuse_routing:
+                            self.assertIs(quantize.call_args.args[0], routed_x)
+                            self.assertEqual(
+                                quantize.call_args.kwargs["dst_type"],
+                                torch.float8_e4m3fn,
+                            )
                         self.assertEqual(gmm1.call_count, 1)
                         self.assertEqual(gmm2.call_count, 1)
                         first, second = gmm1.call_args.kwargs, gmm2.call_args.kwargs
-                        self.assertIs(first["x"], routed_x)
+                        self.assertIs(first["x"], quantized_x)
                         self.assertEqual(
-                            first["x_scale"].data_ptr(), routed_scale.data_ptr()
+                            first["x_scale"].data_ptr(), quantized_scale.data_ptr()
                         )
                         self.assertEqual(first["x_scale"].shape, (4, 1, 2))
                         self.assertTrue(
@@ -196,8 +225,8 @@ class TestMXFP4Routing(unittest.TestCase):
                 self.assertEqual(gmm2.call_args.kwargs["output_dtype"], output_dtype)
 
     def test_deepep_mode_overrides_remain_independent_of_tp_default(self):
-        # The same config must select MXFP8 for TP, BF16 for DeepEP normal,
-        # and MXFP8 for DeepEP low-latency. Explicit user overrides still win.
+        # The TP choice must not change either DeepEP mode. Explicit user
+        # overrides still win over mode-specific defaults.
         config = {
             "dispatcher_output_dtype": "mxfp8",
             "normal_dispatcher_output_dtype": "bf16",
@@ -209,10 +238,14 @@ class TestMXFP4Routing(unittest.TestCase):
                 moe_utils.envs.SGLANG_DEEPEP_BF16_DISPATCH, "get", return_value=False
             ),
         ):
-            for mode, expected in (
-                (DeepEPMode.NORMAL, DispatcherOutputDtype.BF16),
-                (DeepEPMode.LOW_LATENCY, DispatcherOutputDtype.MXFP8),
+            for tp_dtype, (mode, expected) in product(
+                ("bf16", "mxfp8"),
+                (
+                    (DeepEPMode.NORMAL, DispatcherOutputDtype.BF16),
+                    (DeepEPMode.LOW_LATENCY, DispatcherOutputDtype.MXFP8),
+                ),
             ):
+                config["dispatcher_output_dtype"] = tp_dtype
                 dispatcher = SimpleNamespace(quant_config=config, dispatch_mode=mode)
                 self.assertEqual(
                     moe_utils.get_deepep_output_dtype(dispatcher), expected

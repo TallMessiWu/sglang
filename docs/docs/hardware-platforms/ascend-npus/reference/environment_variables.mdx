@@ -38,6 +38,11 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>false</code></td>
     </tr>
     <tr>
+      <td><code>SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT</code></td>
+      <td>Fuse MXFP8 activation quantization into ordinary TP routing for online MXFP W4A8 and ModelSlim <code>W4A8_MXFP</code> MoE. Set to <code>0</code> before server startup to route floating-point activations and quantize them before the fused first expert matmul. FP4 expert weights and fused expert computation are retained. DeepEP normal and low-latency dispatch defaults are unaffected. Changing this option requires restarting the server.</td>
+      <td><code>true</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>
