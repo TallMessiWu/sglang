@@ -368,13 +368,16 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
                 weight_scale.dtype,
             )
 
-        # Ascend TP fuses MXFP8 activation quantization into routing. Preserve
-        # DeepEP's mode-specific contracts: normal stays BF16 for multi-node
-        # prefill, while low-latency returns MXFP8 with E8M0 block scales.
+        # Resolve ordinary TP routing at load time, before graph capture. With
+        # fusion disabled the existing GMM1 path quantizes the routed input.
+        # DeepEP normal stays BF16; low-latency keeps MXFP8 block scales.
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+            dispatcher_dtype = (
+                "mxfp8" if envs.SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT.get() else "bf16"
+            )
             layer.dispatcher.set_quant_config(
                 {
-                    "dispatcher_output_dtype": "mxfp8",
+                    "dispatcher_output_dtype": dispatcher_dtype,
                     "normal_dispatcher_output_dtype": "bf16",
                     "low_latency_dispatcher_output_dtype": "mxfp8",
                 }
@@ -424,8 +427,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         weight dtype and the e8m0 weight_scale. Returns (e4m3 activations,
         e8m0 block scale) ready for the w2 gmm.
 
-        Ascend TP and DeepEP low-latency supply quantized activations and
-        scales. DeepEP normal supplies BF16 and needs activation quant here.
+        Routing-fused Ascend TP and DeepEP low-latency supply quantized
+        activations and scales. Unfused TP and DeepEP normal need quant here.
         """
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
         if fp4_dtype is None:
