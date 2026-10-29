@@ -172,7 +172,6 @@ class TestNPUW4A8MXFP4MoE(CustomTestCase):
                 )
                 layer.dispatcher.set_quant_config.assert_called_once_with(
                     {
-                        "dispatcher_output_dtype": "mxfp8",
                         "normal_dispatcher_output_dtype": "bf16",
                         "low_latency_dispatcher_output_dtype": "mxfp8",
                     }
