@@ -38,16 +38,6 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>false</code></td>
     </tr>
     <tr>
-      <td><code>SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT</code></td>
-      <td>Fuse MXFP8 activation quantization into ordinary TP routing for online MXFP W4A8 and ModelSlim <code>W4A8_MXFP</code> MoE. Set to <code>0</code> before server startup to route floating-point activations and quantize them before the fused first expert matmul. FP4 expert weights and fused expert computation are retained. DeepEP normal and low-latency dispatch defaults are unaffected. Changing this option requires restarting the server.</td>
-      <td><code>true</code></td>
-    </tr>
-    <tr>
-      <td><code>SGLANG_NPU_W4A8_MOE_UNFUSED_ROUTING_MIN_TOKENS</code></td>
-      <td>Opt-in size cutoff for the ordinary TP routing fusion above. A positive integer routes floating-point activations when the local input token count, before top-k expansion, is greater than or equal to the cutoff; GMM1 then quantizes them separately. Smaller inputs retain fused routing. <code>0</code> disables the cutoff and preserves existing behavior. This is a shape-based policy, including graph capture sizes, not a prefill/decode mode switch. Choose a cutoff using your model and workload; no universal value is selected. Ignored when routing fusion is disabled and by DeepEP. Set before server startup.</td>
-      <td><code>0</code></td>
-    </tr>
-    <tr>
       <td><code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
       <td>The maximum number of dispatched tokens on each rank.</td>
       <td><code>128</code></td>

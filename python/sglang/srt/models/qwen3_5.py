@@ -184,6 +184,11 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
+)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -528,6 +533,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
+
     @staticmethod
     def _override_weight_loader(param, loader):
         """Robustly override loader for:
@@ -812,25 +833,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if (
-            _is_npu
-            and not get_forward().sp_active
-            and not (get_lora().enable_lora or get_lora().lora_paths)
-        ):
-            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-                NPUMXFP4W4A8LinearMethod,
-            )
-
-            if (
-                type(self.in_proj_qkvz.quant_method) is NPUMXFP4W4A8LinearMethod
-                and type(self.in_proj_ba.quant_method) is NPUMXFP4W4A8LinearMethod
-            ):
-                # Both column projections consume the same full-K input. Keep
-                # their module calls, weights and output dtypes independent;
-                # only share this forward's FP8 payload and block scales.
-                prepared = self.in_proj_qkvz.quant_method.prepare_input(hidden_states)
-                return self.in_proj_qkvz(prepared)[0], self.in_proj_ba(prepared)[0]
-
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -1897,13 +1899,24 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+            if _gdn_online_mxfp4:
+                logger.info(
+                    "Online MXFP4 GDN %s: %d projections",
+                    ",".join(_gdn_online_mxfp4),
+                    mxfp4,
+                )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
