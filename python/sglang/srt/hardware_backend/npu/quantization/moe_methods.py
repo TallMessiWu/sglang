@@ -378,6 +378,9 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             layer.dispatcher.set_quant_config(
                 {
                     "dispatcher_output_dtype": dispatcher_dtype,
+                    "unfused_routing_min_tokens": (
+                        envs.SGLANG_NPU_W4A8_MOE_UNFUSED_ROUTING_MIN_TOKENS.get()
+                    ),
                     "normal_dispatcher_output_dtype": "bf16",
                     "low_latency_dispatcher_output_dtype": "mxfp8",
                 }
