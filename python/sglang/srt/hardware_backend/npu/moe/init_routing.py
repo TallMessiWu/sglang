@@ -87,8 +87,11 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
     Uses ``npu_moe_init_routing_v2``, which integrates expert token counting.
     """
 
-    def __init__(self, quant_mode: int = -1):
+    def __init__(self, quant_mode: int = -1, *, unfused_min_tokens: int = 0):
+        if unfused_min_tokens < 0:
+            raise ValueError("unfused_min_tokens must be nonnegative")
         self.quant_mode = quant_mode
+        self.unfused_min_tokens = unfused_min_tokens
 
     def _init_routing(
         self,
@@ -98,6 +101,15 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
         top_k: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         num_tokens = hidden_states.shape[0]
+        quant_mode = self.quant_mode
+        if (
+            quant_mode == MXFP8_QUANT_MODE
+            and self.unfused_min_tokens > 0
+            and num_tokens >= self.unfused_min_tokens
+        ):
+            # Keep the choice local to this shape/capture. The next small batch
+            # must still use fusion; GMM1 quantizes the floating-point output.
+            quant_mode = -1
         hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops.npu.npu_moe_init_routing_v2(
                 hidden_states,
@@ -107,12 +119,12 @@ class NPUMoEInitRouting_v2(BaseInitRouting):
                 expert_tokens_num_type=1,
                 expert_tokens_num_flag=True,
                 active_expert_range=[0, num_experts],
-                quant_mode=self.quant_mode,
+                quant_mode=quant_mode,
             )
         )
-        if self.quant_mode == -1:
+        if quant_mode == -1:
             pertoken_scale = None
-        elif self.quant_mode == MXFP8_QUANT_MODE:
+        elif quant_mode == MXFP8_QUANT_MODE:
             pertoken_scale = _normalize_mxfp_scale(pertoken_scale)
         expert_tokens = expert_tokens.to(torch.int64)
         return hidden_states, expanded_row_idx, expert_tokens, pertoken_scale

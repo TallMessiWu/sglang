@@ -1065,6 +1065,9 @@ class Envs:
     # W4A8 ordinary TP: set to 0 to quantize after routing. Resolved at load time;
     # DeepEP normal/low-latency dispatch contracts remain independent.
     SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT = EnvBool(True)
+    # Opt-in TP routing cutoff in input tokens (before top-k expansion).
+    # Zero preserves fused routing at every size; tune against the workload.
+    SGLANG_NPU_W4A8_MOE_UNFUSED_ROUTING_MIN_TOKENS = EnvInt(0)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
