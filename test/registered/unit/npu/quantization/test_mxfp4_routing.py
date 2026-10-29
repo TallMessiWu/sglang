@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.quantization  # noqa: F401
+from sglang.srt.hardware_backend.npu.moe.init_routing import NPUMoEInitRouting_v2
 from sglang.srt.hardware_backend.npu.quantization import moe_methods
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.moe_runner.ascend import (
@@ -24,10 +25,22 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestMXFP4Routing(unittest.TestCase):
+    def test_token_threshold_is_opt_in(self):
+        self.assertEqual(
+            moe_methods.envs.SGLANG_NPU_W4A8_MOE_UNFUSED_ROUTING_MIN_TOKENS.default, 0
+        )
+        self.assertTrue(moe_methods.envs.SGLANG_NPU_W4A8_MOE_FUSE_ROUTING_QUANT.default)
+
     def test_online_and_offline_routing_reuse_scales_and_preserve_dtype(self):
-        for online, fuse_routing in product((False, True), repeat=2):
+        for online, fuse_routing, min_tokens in product(
+            (False, True), (False, True), (0, 2, 3)
+        ):
+            # Two input tokens: threshold 2 splits, 0/3 keep fusion eligible.
+            fused_batch = fuse_routing and min_tokens != 2
             for dtype in (torch.bfloat16, torch.float16):
-                with self.subTest(online=online, dtype=dtype, fused=fuse_routing):
+                with self.subTest(
+                    online=online, dtype=dtype, fused=fuse_routing, threshold=min_tokens
+                ):
                     layer = torch.nn.Module()
                     layer.w13_kernel = moe_methods.NPUW4A8MXFP4MoEMethod()
                     layer.w2_kernel = moe_methods.NPUW4A8MXFP4MoEMethod()
@@ -58,6 +71,11 @@ class TestMXFP4Routing(unittest.TestCase):
                             return_value=fuse_routing,
                         ),
                         patch.object(
+                            moe_methods.envs.SGLANG_NPU_W4A8_MOE_UNFUSED_ROUTING_MIN_TOKENS,
+                            "get",
+                            return_value=min_tokens,
+                        ),
+                        patch.object(
                             moe_methods, "_get_float4_e2m1fn_x2_dtype", return_value=296
                         ),
                         patch.object(
@@ -78,12 +96,12 @@ class TestMXFP4Routing(unittest.TestCase):
                         quantized_scale = torch.ones(4, 1, 2, dtype=torch.uint8)
                         routed_x = (
                             quantized_x
-                            if fuse_routing
+                            if fused_batch
                             else torch.zeros(4, 64, dtype=dtype)
                         )
-                        routed_scale = (
-                            quantized_scale.flatten(-2) if fuse_routing else None
-                        )
+                        # Unquantized routing must discard the unused scale output,
+                        # including when the router's configured mode remains MXFP8.
+                        routed_scale = quantized_scale.flatten(-2)
                         quant_config = layer.dispatcher.quant_config
                         self.assertEqual(
                             quant_config["normal_dispatcher_output_dtype"], "bf16"
@@ -137,7 +155,7 @@ class TestMXFP4Routing(unittest.TestCase):
                             )
                             self.assertEqual(
                                 routing.call_args.kwargs["quant_mode"],
-                                3 if fuse_routing else -1,
+                                3 if fused_batch else -1,
                             )
                             runner_input = pre_permute_ascend_tp_to_ascend(
                                 dispatch_out, layer, config, {}
@@ -147,8 +165,8 @@ class TestMXFP4Routing(unittest.TestCase):
                             result = runner.run(runner_input, layer, {})
 
                         self.assertEqual(result.hidden_states.dtype, dtype)
-                        self.assertEqual(quantize.call_count, 0 if fuse_routing else 1)
-                        if not fuse_routing:
+                        self.assertEqual(quantize.call_count, 0 if fused_batch else 1)
+                        if not fused_batch:
                             self.assertIs(quantize.call_args.args[0], routed_x)
                             self.assertEqual(
                                 quantize.call_args.kwargs["dst_type"],
@@ -172,6 +190,79 @@ class TestMXFP4Routing(unittest.TestCase):
                         )
                         self.assertIs(second["group_list"], counts)
                         self.assertEqual(second["group_list_type"], 1)
+
+    def test_threshold_is_local_to_each_batch_and_resets_with_quant_config(self):
+        dispatcher = AscendTPDispatcher(MoeRunnerConfig(num_experts=2, top_k=2))
+        dispatcher.set_quant_config(
+            {"dispatcher_output_dtype": "mxfp8", "unfused_routing_min_tokens": 2048}
+        )
+
+        def route(x, ids, **kwargs):
+            rows = x.shape[0] * 2
+            dtype = torch.float8_e4m3fn if kwargs["quant_mode"] == 3 else x.dtype
+            return (
+                torch.zeros(rows, 64, dtype=dtype),
+                torch.arange(rows),
+                torch.full((2,), x.shape[0], dtype=torch.int64),
+                torch.zeros(rows, 2, dtype=torch.uint8),
+            )
+
+        with (
+            patch.object(
+                moe_methods.envs.SGLANG_NPU_W4A8_MOE_UNFUSED_ROUTING_MIN_TOKENS,
+                "get",
+                side_effect=AssertionError("Do not read environment during dispatch"),
+            ),
+            patch.object(
+                torch.ops.npu, "npu_moe_init_routing_v2", side_effect=route, create=True
+            ) as routing,
+        ):
+            for tokens, mode in (
+                (0, 3),
+                (32, 3),
+                (512, 3),
+                (2047, 3),
+                (2048, -1),
+                (7240, -1),
+                (32, 3),
+            ):
+                with self.subTest(tokens=tokens):
+                    output = dispatcher.dispatch(
+                        torch.zeros(tokens, 64, dtype=torch.float16),
+                        (
+                            torch.ones(tokens, 2),
+                            torch.zeros(tokens, 2, dtype=torch.int32),
+                            None,
+                        ),
+                    )
+                    self.assertEqual(routing.call_args.kwargs["quant_mode"], mode)
+                    self.assertEqual(routing.call_args.kwargs["active_num"], tokens * 2)
+                    self.assertEqual(dispatcher.init.quant_mode, 3)
+                    self.assertEqual(output.original_dtype, torch.float16)
+                    self.assertEqual(output.group_list_type, 1)
+                    if mode == 3:
+                        self.assertEqual(
+                            output.hidden_states_scale.shape, (tokens * 2, 1, 2)
+                        )
+                    else:
+                        self.assertIsNone(output.hidden_states_scale)
+                        self.assertEqual(output.hidden_states.dtype, torch.float16)
+
+            for dtype, mode in (("bf16", -1), ("int8", 1), ("mxfp8", 3)):
+                dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
+                dispatcher.dispatch(
+                    torch.zeros(2048, 64, dtype=torch.bfloat16),
+                    (
+                        torch.ones(2048, 2),
+                        torch.zeros(2048, 2, dtype=torch.int32),
+                        None,
+                    ),
+                )
+                self.assertEqual(routing.call_args.kwargs["quant_mode"], mode)
+
+    def test_negative_routing_threshold_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            NPUMoEInitRouting_v2(quant_mode=3, unfused_min_tokens=-1)
 
     def test_unquantized_tp_dispatch_keeps_default_and_empty_input(self):
         dispatcher = AscendTPDispatcher(MoeRunnerConfig(num_experts=2, top_k=2))
@@ -229,6 +320,7 @@ class TestMXFP4Routing(unittest.TestCase):
         # overrides still win over mode-specific defaults.
         config = {
             "dispatcher_output_dtype": "mxfp8",
+            "unfused_routing_min_tokens": 2048,
             "normal_dispatcher_output_dtype": "bf16",
             "low_latency_dispatcher_output_dtype": "mxfp8",
         }
