@@ -57,7 +57,9 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -104,15 +106,12 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.monokernels.runtime import is_metadata_unread
-from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -157,6 +156,9 @@ _OPUS_PREFILL_MIN_TOKENS = 1024
 _OPUS_PREFILL_MAX_ROWS_PER_TOKEN = {1: 256, 2: 128}
 # One ratio's bf16 workspace stays within 1 GiB.
 _OPUS_PREFILL_MAX_WORKSPACE_ROWS = 1 << 20
+# DeepSeek-V4.1's prefill graph metadata width when the user sets no
+# cuda_graph_config[prefill].max_seq_len; longer contexts run eager.
+_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
 @dataclass
@@ -893,12 +895,6 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
-    prefill_cuda_graph_default_max_seq_len = (
-        DeepseekV4AttnBackend.prefill_cuda_graph_default_max_seq_len
-    )
-    _prefill_graph_replays_any_context = (
-        DeepseekV4AttnBackend._prefill_graph_replays_any_context
-    )
     _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
@@ -2015,7 +2011,7 @@ class DeepseekV4HipRadixBackend(
                 )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -2142,7 +2138,7 @@ class DeepseekV4HipRadixBackend(
                 block_size=int(forward_batch.spec_info.draft_token_num),
             )
         elif forward_batch.forward_mode.is_target_verify():
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -2364,6 +2360,12 @@ class DeepseekV4HipRadixBackend(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu,
         )
+
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        if self.low_ratios != (1, 2) or get_parallel().attn_cp_size > 1:
+            return None
+        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
 
     def _graph_metadata_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """
@@ -3713,6 +3715,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             # Propagate the real runtime mode so inner backends can detect IDLE
             # and apply their idle substitution.
             actual_forward_mode=actual_forward_mode,
