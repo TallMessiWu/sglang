@@ -8,16 +8,10 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
+from sglang.srt.utils import is_npu
 
-if current_platform.is_npu():
+if is_npu():
     import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.schedule", torch_npu.profiler.schedule],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
 
 logger = init_logger(__name__)
 
@@ -80,13 +74,18 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
-        activities = [torch.profiler.ProfilerActivity.CPU]
+        # NPU trace handlers require a torch_npu profile instance. Select the
+        # backend directly instead of relying on version-dependent global patches.
+        profiler_module = (
+            torch_npu.profiler if current_platform.is_npu() else torch.profiler
+        )
+        activities = [profiler_module.ProfilerActivity.CPU]
         if torch.cuda.is_available() or (
             hasattr(torch, "musa") and torch.musa.is_available()
         ):
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         if current_platform.is_npu():
-            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+            activities.append(profiler_module.ProfilerActivity.NPU)
 
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
@@ -98,21 +97,21 @@ class SGLDiffusionProfiler:
             on_trace_ready=(
                 None
                 if not current_platform.is_npu()
-                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+                else profiler_module.tensorboard_trace_handler(self.log_dir)
             ),
         )
         if self.full_profile:
             # profile all stages
-            self.profiler = torch.profiler.profile(**common_torch_profiler_args)
+            self.profiler = profiler_module.profile(**common_torch_profiler_args)
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
             warmup = 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
             self.num_active_steps = num_actual_steps + warmup
-            self.profiler = torch.profiler.profile(
+            self.profiler = profiler_module.profile(
                 **common_torch_profiler_args,
-                schedule=torch.profiler.schedule(
+                schedule=profiler_module.schedule(
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
