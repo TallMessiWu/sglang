@@ -1,23 +1,23 @@
 import contextlib
 import gzip
+import multiprocessing
 import os
 from collections.abc import Iterator
 
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
+from sglang.multimodal_gen.runtime.utils.npu_profile_analysis import analyze_npu_profile
+from sglang.srt.utils import is_npu
 
-if current_platform.is_npu():
+if is_npu():
     import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.schedule", torch_npu.profiler.schedule],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
 
 logger = init_logger(__name__)
 
@@ -80,13 +80,22 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
-        activities = [torch.profiler.ProfilerActivity.CPU]
+        # NPU callbacks require the native NPU profile object, not a global
+        # torch patch whose behavior depends on the installed torch_npu version.
+        profiler_module = (
+            torch_npu.profiler if current_platform.is_npu() else torch.profiler
+        )
+        self._needs_npu_analysis = (
+            current_platform.is_npu() and multiprocessing.current_process().daemon
+        )
+        self._analysis_finished = False
+        activities = [profiler_module.ProfilerActivity.CPU]
         if torch.cuda.is_available() or (
             hasattr(torch, "musa") and torch.musa.is_available()
         ):
             activities.append(torch.profiler.ProfilerActivity.CUDA)
         if current_platform.is_npu():
-            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+            activities.append(profiler_module.ProfilerActivity.NPU)
 
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
@@ -98,21 +107,23 @@ class SGLDiffusionProfiler:
             on_trace_ready=(
                 None
                 if not current_platform.is_npu()
-                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+                else profiler_module.tensorboard_trace_handler(
+                    self.log_dir, analyse_flag=not self._needs_npu_analysis
+                )
             ),
         )
         if self.full_profile:
             # profile all stages
-            self.profiler = torch.profiler.profile(**common_torch_profiler_args)
+            self.profiler = profiler_module.profile(**common_torch_profiler_args)
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
             warmup = 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
             self.num_active_steps = num_actual_steps + warmup
-            self.profiler = torch.profiler.profile(
+            self.profiler = profiler_module.profile(
                 **common_torch_profiler_args,
-                schedule=torch.profiler.schedule(
+                schedule=profiler_module.schedule(
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
@@ -158,22 +169,54 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        if torch.cuda.is_available() or (
-            hasattr(torch, "musa") and torch.musa.is_available()
-        ):
-            torch.cuda.synchronize()
-        if current_platform.is_npu():
-            torch.npu.synchronize()
-            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
-        self.profiler.stop()
+        try:
+            if torch.cuda.is_available() or (
+                hasattr(torch, "musa") and torch.musa.is_available()
+            ):
+                torch.cuda.synchronize()
+            if current_platform.is_npu():
+                torch.npu.synchronize()
+                export_trace = False  # Native NPU data is finalized by stop().
+            self.profiler.stop()
 
-        if export_trace:
-            if dump_rank is not None and dump_rank != self.rank:
-                pass
-            else:
+            if export_trace and (dump_rank is None or dump_rank == self.rank):
                 self._export_trace()
+        finally:
+            SGLDiffusionProfiler._instance = None
 
-        SGLDiffusionProfiler._instance = None
+    def finish(self, dump_rank: int | None = None) -> None:
+        """Finish a request, including automatic parsing outside daemon workers.
+
+        A short window can stop() during denoising. Analysis waits until the
+        pipeline finishes, and uses only this rank's exact capture directory.
+        """
+        if not self._needs_npu_analysis or self._analysis_finished:
+            self.stop(dump_rank=dump_rank)
+            return
+        self._analysis_finished = True
+        error = None
+        try:
+            self.stop(dump_rank=dump_rank)
+            trace = analyze_npu_profile(self.profiler.prof_if.prof_path)
+            logger.info("Saved NPU profiler trace to: %s", trace)
+        except Exception as exc:
+            error = f"rank {self.rank}: {exc}"
+            logger.error("NPU profiler analysis failed: %s", error)
+
+        errors = [error]
+        if model_parallel_is_initialized():
+            group = get_replica_group()
+            if group.world_size > 1:
+                # A non-driver's failure must not turn into success on the
+                # driver. All ranks reach this after normal pipeline completion.
+                errors = [None] * group.world_size
+                torch.distributed.all_gather_object(
+                    errors, error, group=group.cpu_group
+                )
+        if any(errors):
+            raise RuntimeError(
+                "NPU profiler analysis failed: " + "; ".join(e for e in errors if e)
+            )
 
     def _export_trace(self):
 
