@@ -1,5 +1,6 @@
 import contextlib
 import gzip
+import multiprocessing
 import os
 from collections.abc import Iterator
 
@@ -97,7 +98,12 @@ class SGLDiffusionProfiler:
             on_trace_ready=(
                 None
                 if not current_platform.is_npu()
-                else profiler_module.tensorboard_trace_handler(self.log_dir)
+                else profiler_module.tensorboard_trace_handler(
+                    self.log_dir,
+                    # Parsing spawns subprocesses, which daemon workers cannot do.
+                    # Keep raw data for offline analysis in a non-daemon process.
+                    analyse_flag=not multiprocessing.current_process().daemon,
+                )
             ),
         )
         if self.full_profile:
@@ -163,7 +169,8 @@ class SGLDiffusionProfiler:
             torch.cuda.synchronize()
         if current_platform.is_npu():
             torch.npu.synchronize()
-            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
+            # torch_npu saves raw data; daemon workers defer parsing until offline.
+            export_trace = False
         self.profiler.stop()
 
         if export_trace:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU regressions for profiler backend selection and trace callback ownership."""
 
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,11 +50,25 @@ class TestDiffusionProfiler(unittest.TestCase):
             patch.object(torch, "npu", SimpleNamespace(synchronize=Mock()), create=True)
         )
         self.callbacks = []
+        self.process = self.enterContext(
+            patch.object(
+                multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(daemon=False),
+            )
+        )
 
-        def trace_ready(instance):
-            # This is the contract used by torch_npu.tensorboard_trace_handler.
-            instance.prof_if.analyse()
-            self.callbacks.append(instance)
+        def trace_handler(directory, analyse_flag=True):
+            def trace_ready(instance):
+                if analyse_flag:
+                    if self.process.return_value.daemon:
+                        raise RuntimeError(
+                            "Cannot parse profiling data in a daemon process"
+                        )
+                    instance.prof_if.analyse()
+                self.callbacks.append(instance)
+
+            return trace_ready
 
         self.npu_api = SimpleNamespace(
             profile=Mock(side_effect=FakeNPUProfile),
@@ -62,7 +77,7 @@ class TestDiffusionProfiler(unittest.TestCase):
                 CPU=torch.profiler.ProfilerActivity.CPU,
                 NPU=torch.profiler.ProfilerActivity.CPU,
             ),
-            tensorboard_trace_handler=Mock(return_value=trace_ready),
+            tensorboard_trace_handler=Mock(side_effect=trace_handler),
         )
         self.enterContext(
             patch.object(
@@ -105,11 +120,15 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.torch_profile.assert_not_called()
         self.torch_schedule.assert_not_called()
 
-    def test_npu_full_profile_callback_on_stop(self):
+    def test_npu_full_profile_records_both_steps_without_schedule_warmup(self):
         wrapper = self.make_profiler(full=True)
-        torch.ones(1).add_(1)
+        for step in range(2):
+            with torch.profiler.record_function(f"denoising_step_{step}"):
+                torch.ones(1).add_(1)
         wrapper.step_stage()
         wrapper.stop()
+        names = {event.name for event in wrapper.profiler.events()}
+        self.assertTrue({"denoising_step_0", "denoising_step_1"} <= names)
         self.assertEqual(self.callbacks, [wrapper.profiler])
         self.npu_api.profile.assert_called_once()
         self.npu_api.schedule.assert_not_called()
@@ -125,6 +144,21 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.npu_api.schedule.assert_called_once_with(
             skip_first=0, wait=0, warmup=1, active=41, repeat=1
         )
+
+    def test_daemon_worker_defers_analysis_but_keeps_trace_callback(self):
+        self.process.return_value.daemon = True
+        for full in (False, True):
+            with self.subTest(full=full):
+                wrapper = self.make_profiler(full=full)
+                if not full:
+                    wrapper.step_denoising_step()
+                torch.ones(1).add_(1)
+                wrapper.stop()
+                self.npu_api.tensorboard_trace_handler.assert_called_with(
+                    self.directory, analyse_flag=False
+                )
+                self.assertIs(self.callbacks[-1], wrapper.profiler)
+                wrapper.profiler.prof_if.analyse.assert_not_called()
 
     def test_non_npu_keeps_torch_profiler_and_chrome_export(self):
         self.npu_platform.return_value = False
