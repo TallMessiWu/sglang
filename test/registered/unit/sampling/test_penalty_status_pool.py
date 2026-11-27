@@ -1,9 +1,11 @@
 import random
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.sampling import penalties
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -213,6 +215,31 @@ class TestHistory(CustomTestCase):
 
 
 class TestParams(CustomTestCase):
+    def test_npu_presence_penalty_avoids_boolean_addcmul(self):
+        pool = _pool()
+        reqs = [
+            _req(1, [2, 2, 7], frequency_penalty=0.5, presence_penalty=1.5),
+            _req(2, [3], presence_penalty=-0.25, repetition_penalty=1.2),
+        ]
+        for req in reqs:
+            _admit(pool, req)
+
+        addcmul = torch.Tensor.addcmul_
+
+        def reject_bool(tensor, tensor1, tensor2, *, value=1):
+            if torch.bool in (tensor1.dtype, tensor2.dtype):
+                raise RuntimeError("ACLNN addcmul does not accept bool inputs")
+            return addcmul(tensor, tensor1, tensor2, value=value)
+
+        with (
+            patch.object(penalties, "_is_npu", True),
+            patch.object(torch.Tensor, "addcmul_", reject_bool),
+        ):
+            actual = StepPenalties.build(reqs, pool).logit_penalties()
+
+        expected = _expected_penalties(reqs, [req.output_ids for req in reqs])
+        torch.testing.assert_close(actual, expected)
+
     def test_reused_index_takes_the_new_request_params(self):
         pool = _pool()
         live = _req(1, presence_penalty=1.0)
