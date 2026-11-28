@@ -33,9 +33,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+    gguf_runtime_layout,
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
-    remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -160,6 +160,7 @@ class TransformerQuantLoadSpec:
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
     # Set instead of ``safetensors_list`` when the transformer comes from GGUF.
     gguf_file: Optional[str] = None
+    gguf_shard_plan: dict[str, tuple[str, int, int]] = field(default_factory=dict)
 
     @property
     def runtime_quant_config(self) -> Optional[object]:
@@ -549,10 +550,10 @@ def _validate_gguf_runtime_support(
             "--transformer-weights-path at either an SVDQuant checkpoint or a "
             ".gguf, not one while requesting the other."
         )
-    if not current_platform.is_cuda():
+    if not (current_platform.is_cuda() or current_platform.is_mps()):
         raise ValueError(
-            "GGUF diffusion checkpoints require CUDA; the GGML kernels have no "
-            f"{current_platform.device_type} implementation."
+            "GGUF diffusion checkpoints require CUDA or Apple MPS; the GGML "
+            f"dequantization path has no {current_platform.device_type} implementation."
         )
     uses_fsdp = (
         server_args.should_use_fsdp_for_component(component_name)
@@ -707,6 +708,7 @@ def resolve_transformer_quant_load_spec(
             server_args=server_args,
             model_cls=model_cls,
             component_name=component_name,
+            arch_config=arch_config,
         )
 
     if checkpoint_quant_config is not None:
@@ -794,6 +796,7 @@ def _resolve_gguf_quant_load_spec(
     server_args: ServerArgs,
     model_cls: type[nn.Module],
     component_name: str | None = None,
+    arch_config: DiTArchConfig | None = None,
 ) -> TransformerQuantLoadSpec:
     """Build the load plan for a GGUF transformer checkpoint."""
     from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
@@ -801,12 +804,21 @@ def _resolve_gguf_quant_load_spec(
     _validate_gguf_runtime_support(server_args, component_name)
 
     tensor_meta = read_gguf_tensor_meta(gguf_file)
+    mapping = (
+        getattr(arch_config, "param_names_mapping", None)
+        or vars(model_cls).get("param_names_mapping")
+        or {}
+    )
     dequantize_prefixes = vars(model_cls).get("gguf_dequantize_prefixes", ())
-    if dequantize_prefixes:
-        tensor_meta = remap_gguf_tensor_meta(
-            tensor_meta, lambda name: name, dequantize_prefixes=dequantize_prefixes
+    shard_plan: dict[str, tuple[str, int, int]] = {}
+    if mapping or dequantize_prefixes:
+        tensor_meta, shard_plan = gguf_runtime_layout(
+            tensor_meta,
+            mapping,
+            dequantize_prefixes=dequantize_prefixes,
         )
     quant_config = GGUFConfig(gguf_file=gguf_file, tensor_meta=tensor_meta)
+    quant_config.validate_supported_types(current_platform)
     packed = getattr(model_cls, "packed_modules_mapping", None)
     if packed:
         quant_config.packed_modules_mapping = packed
@@ -822,6 +834,7 @@ def _resolve_gguf_quant_load_spec(
         # whenever a quant_config is present.
         param_dtype=None,
         gguf_file=gguf_file,
+        gguf_shard_plan=shard_plan,
     )
 
 

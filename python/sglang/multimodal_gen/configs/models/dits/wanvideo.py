@@ -10,7 +10,7 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 class WanVideoArchConfig(DiTArchConfig):
     param_names_mapping: dict = field(
         default_factory=lambda: {
-            r"^patch_embedding\.(.*)$": r"patch_embedding.proj.\1",
+            r"^patch_embedding\.(?!proj\.)(.*)$": r"patch_embedding.proj.\1",
             r"^condition_embedder\.text_embedder\.linear_1\.(.*)$": r"condition_embedder.text_embedder.fc_in.\1",
             r"^condition_embedder\.text_embedder\.linear_2\.(.*)$": r"condition_embedder.text_embedder.fc_out.\1",
             r"^condition_embedder\.time_embedder\.linear_1\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_in.\1",
@@ -34,6 +34,31 @@ class WanVideoArchConfig(DiTArchConfig):
             r"^blocks\.(\d+)\.attn1\.to_k_rot$": r"blocks.\1.k_rot",
             r"^blocks\.(\d+)\.attn1\.q_rot$": r"blocks.\1.q_rot",
             r"^blocks\.(\d+)\.attn1\.k_rot$": r"blocks.\1.k_rot",
+            # Official / ComfyUI / GGUF Wan checkpoint names
+            r"^text_embedding\.0\.(.*)$": r"condition_embedder.text_embedder.fc_in.\1",
+            r"^text_embedding\.2\.(.*)$": r"condition_embedder.text_embedder.fc_out.\1",
+            r"^time_embedding\.0\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_in.\1",
+            r"^time_embedding\.2\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_out.\1",
+            r"^time_projection\.1\.(.*)$": r"condition_embedder.time_modulation.linear.\1",
+            r"^img_emb\.norm_front\.(.*)$": r"condition_embedder.image_embedder.norm1.\1",
+            r"^img_emb\.proj\.1\.(.*)$": r"condition_embedder.image_embedder.ff.fc_in.\1",
+            r"^img_emb\.proj\.3\.(.*)$": r"condition_embedder.image_embedder.ff.fc_out.\1",
+            r"^img_emb\.norm_back\.(.*)$": r"condition_embedder.image_embedder.norm2.\1",
+            r"^head\.head\.(.*)$": r"proj_out.\1",
+            r"^head\.modulation$": r"scale_shift_table",
+            r"^blocks\.(\d+)\.self_attn\.(q|k|v)\.(.*)$": r"blocks.\1.to_\2.\3",
+            r"^blocks\.(\d+)\.self_attn\.o\.(.*)$": r"blocks.\1.to_out.\2",
+            r"^blocks\.(\d+)\.self_attn\.(norm_q|norm_k)\.(.*)$": r"blocks.\1.\2.\3",
+            r"^blocks\.(\d+)\.cross_attn\.(q|k|v)\.(.*)$": r"blocks.\1.attn2.to_\2.\3",
+            r"^blocks\.(\d+)\.cross_attn\.o\.(.*)$": r"blocks.\1.attn2.to_out.\2",
+            r"^blocks\.(\d+)\.cross_attn\.(norm_q|norm_k)\.(.*)$": r"blocks.\1.attn2.\2.\3",
+            r"^blocks\.(\d+)\.cross_attn\.k_img\.(.*)$": r"blocks.\1.attn2.add_k_proj.\2",
+            r"^blocks\.(\d+)\.cross_attn\.v_img\.(.*)$": r"blocks.\1.attn2.add_v_proj.\2",
+            r"^blocks\.(\d+)\.cross_attn\.norm_k_img\.(.*)$": r"blocks.\1.attn2.norm_added_k.\2",
+            r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
+            r"^blocks\.(\d+)\.ffn\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
+            r"^blocks\.(\d+)\.norm3\.(.*)$": r"blocks.\1.self_attn_residual_norm.norm.\2",
+            r"^blocks\.(\d+)\.modulation$": r"blocks.\1.scale_shift_table",
         }
     )
 

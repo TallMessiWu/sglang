@@ -154,7 +154,11 @@ def get_param_names_mapping(
         max_steps = max(8, len(mapping_dict) * 2)
         applied_patterns: set[str] = set()
         visited_names: set[str] = {name}
-        valid_mapping = None
+        valid_mapping = (
+            (name, None, None)
+            if valid_target_names is not None and name in valid_target_names
+            else None
+        )
 
         for _ in range(max_steps):
             transformed = False

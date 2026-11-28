@@ -20,7 +20,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
+from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+    gguf_weights_iterator,
+    runtime_gguf_weights,
+)
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
     inspect_minimax_h3_safetensors,
@@ -591,10 +594,15 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 weight_load_plan=weight_load_plan,
                 checkpoint_key_filter=checkpoint_key_filter,
                 weights_iterator=(
-                    gguf_weights_iterator(
-                        quant_spec.gguf_file,
+                    runtime_gguf_weights(
+                        gguf_weights_iterator(
+                            quant_spec.gguf_file,
+                            quant_spec.quant_config.tensor_meta,
+                            key_filter=checkpoint_key_filter,
+                        ),
                         quant_spec.quant_config.tensor_meta,
-                        key_filter=checkpoint_key_filter,
+                        quant_spec.gguf_shard_plan,
+                        quant_spec.quant_config,
                     )
                     if quant_spec.gguf_file is not None
                     else None

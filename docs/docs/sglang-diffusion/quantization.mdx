@@ -165,9 +165,9 @@ backend.
       <td><code>gguf</code></td>
       <td>One selected GGUF DiT or native encoder file</td>
       <td><code>--component-weights-paths.&lt;component&gt;</code></td>
-      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs and its Qwen3-VL text encoder</td>
+      <td>MiniMax-H3 original or pruned FL2VA / Ref2VA DiTs (and its Qwen3-VL text encoder), Wan2.1 DiTs, and native DiTs whose parameter mappings resolve the checkpoint names</td>
       <td>None</td>
-      <td>CUDA only and auto-detected; supports standard and K-quant GGML types. TP requires aligned GGML blocks; component/layerwise offload is supported and FSDP is not.</td>
+      <td>CUDA and Apple MPS; auto-detected. CUDA supports standard, K-quant, and I-matrix GGML types; Apple MPS keeps packed <code>uint8</code> weights and supports standard and K-quant types via PyTorch MPS dequantization. TP requires aligned GGML blocks; component/layerwise offload is supported and FSDP is not.</td>
     </tr>
     <tr>
       <td><code>comfy-fp8</code></td>
@@ -890,11 +890,11 @@ BF16. With full layerwise offload, VAE decode and offload buffers can still
 dominate peak GPU memory, but each streamed DiT layer also transfers fewer
 bytes.
 
-Packed linears reuse SRT's GGUF type definitions and CUDA dequantization, then
-run the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
-regime and are slower at diffusion sequence lengths. GGUF remains a
-capacity-oriented option; latency depends on the quantization type, activation
-shape, and placement policy.
+Packed linears reuse SRT's GGUF type definitions and CUDA or pure-PyTorch MPS
+dequantization, then run the native GEMM. SRT's fused MMVQ/MMQ kernels target
+the low-token LLM regime and are slower at diffusion sequence lengths. GGUF
+remains a capacity-oriented option; latency depends on the quantization type,
+activation shape, and placement policy.
 
 Layers the checkpoint stores unquantized (F32/F16/BF16) take the ordinary linear
 path rather than the packed one. Their precision is then whatever the model
@@ -967,7 +967,7 @@ does, and the 6× slower decode is the price of fitting.
 | --- | --- |
 | TP shard boundaries must align to GGML blocks | Column-parallel rows shard directly; row-parallel packed columns require each local input partition to contain whole quantization blocks |
 | No `--use-fsdp-inference` | FSDP does not preserve the GGUF packed-block layout |
-| CUDA only | The reused SRT GGML dequantization kernel currently ships for CUDA |
+| CUDA or Apple MPS | Packed linear execution uses CUDA GGML kernels on NVIDIA GPUs or vectorized PyTorch dequantization (standard and K-quant types) on Apple MPS; I-matrix (`IQ*`) types require CUDA and are rejected at startup on MPS |
 | Native byte order only | A quantized block embeds its scales, so a non-native file cannot be byte-swapped as a whole |
 | No LoRA, and none of the H3 AdaLN cache flags | An adapter cannot be merged into packed blocks, and the AdaLN paths read the transformer's safetensors |
 | No `--quantization` | The checkpoint fixes the quantization; the flag would be a second, conflicting selector |

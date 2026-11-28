@@ -468,10 +468,11 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
 
     def validate_component_weight_override(self, override: str) -> None:
         if names_gguf_checkpoint(override):
-            if not current_platform.is_cuda():
+            if not (current_platform.is_cuda() or current_platform.is_mps()):
                 raise ValueError(
-                    "GGUF encoder checkpoints require CUDA; the GGML kernels have "
-                    f"no {current_platform.device_type} implementation"
+                    "GGUF encoder checkpoints require CUDA or Apple MPS; the GGML "
+                    f"dequantization path has no {current_platform.device_type} "
+                    "implementation"
                 )
 
     def resolve_native_transformers_model_class(self, config: PretrainedConfig) -> type:
@@ -746,6 +747,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 quant_config.retain_tensor_meta(
                     model.should_materialize_checkpoint_weight
                 )
+                quant_config.validate_supported_types(current_platform)
             if quant_config is not None:
                 _require_quantized_encoder_layers(
                     model, component_name, quant_config=quant_config

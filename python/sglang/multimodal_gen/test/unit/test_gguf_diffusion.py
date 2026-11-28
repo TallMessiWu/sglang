@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import gguf
 import numpy as np
 import torch
 from gguf import GGMLQuantizationType as WeightType
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
     QwenImage21ArchConfig,
     QwenImage21DitConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoArchConfig
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -42,9 +44,14 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _resolve_gguf_quant_load_spec,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Attention,
     QwenImage21Transformer2DModel,
+)
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
+    WanTransformer3DModel,
+    WanTransformerBlock,
 )
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
@@ -610,6 +617,7 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
             "sglang.multimodal_gen.runtime.loader.transformer_load_utils.current_platform"
         ) as platform:
             platform.is_cuda.return_value = True
+            platform.is_mps.return_value = False
             return _resolve_gguf_quant_load_spec(
                 gguf_file=str(self.gguf),
                 server_args=server_args,
@@ -623,7 +631,7 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
         # Each tensor keeps its checkpoint dtype rather than a single cast.
         self.assertIsNone(spec.param_dtype)
 
-    def test_rejects_non_cuda_platform(self):
+    def test_rejects_non_cuda_or_mps_platform(self):
         """Fail before reading a multi-GiB checkpoint, not at the first linear."""
         from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
             _resolve_gguf_quant_load_spec,
@@ -641,13 +649,114 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
             "sglang.multimodal_gen.runtime.loader.transformer_load_utils.current_platform"
         ) as platform:
             platform.is_cuda.return_value = False
+            platform.is_mps.return_value = False
             platform.device_type = "rocm"
-            with self.assertRaisesRegex(ValueError, "require CUDA"):
+            with self.assertRaisesRegex(ValueError, "CUDA or Apple MPS.*rocm"):
                 _resolve_gguf_quant_load_spec(
                     gguf_file=str(self.gguf),
                     server_args=server_args,
                     model_cls=Mock(packed_modules_mapping=None),
                 )
+
+    def test_accepts_mps_platform_for_supported_types(self):
+        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+            _resolve_gguf_quant_load_spec,
+        )
+
+        for ggml_type, in_features in (
+            (WeightType.Q8_0, 32),
+            (WeightType.Q4_0, 32),
+            (WeightType.Q4_K, 256),
+            (WeightType.Q6_K, 256),
+        ):
+            with self.subTest(weight_type=ggml_type.name):
+                block_size, type_size = gguf.GGML_QUANT_SIZES[ggml_type]
+                row_bytes = in_features // block_size * type_size
+                path = self.tmp / f"{ggml_type.name.lower()}.gguf"
+                _write_gguf(
+                    path,
+                    [
+                        (
+                            "w.weight",
+                            [in_features, 2],
+                            int(ggml_type),
+                            bytes(2 * row_bytes),
+                        )
+                    ],
+                )
+                server_args = Mock(
+                    tp_size=1,
+                    use_fsdp_inference=False,
+                    lora_path=None,
+                    minimax_h3_adaln_online=False,
+                    minimax_h3_adaln_cache_path=None,
+                    quantization=None,
+                    nunchaku_config=None,
+                )
+                with patch(
+                    "sglang.multimodal_gen.runtime.loader.transformer_load_utils.current_platform"
+                ) as platform:
+                    platform.is_cuda.return_value = False
+                    platform.is_mps.return_value = True
+                    platform.device_type = "mps"
+                    spec = _resolve_gguf_quant_load_spec(
+                        gguf_file=str(path),
+                        server_args=server_args,
+                        model_cls=Mock(packed_modules_mapping=None),
+                    )
+                self.assertEqual(spec.gguf_file, str(path))
+
+    def test_mps_rejects_unsupported_gguf_type_at_spec_resolution(self):
+        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+            _resolve_gguf_quant_load_spec,
+        )
+
+        block_size, type_size = gguf.GGML_QUANT_SIZES[WeightType.IQ4_NL]
+        row_bytes = 256 // block_size * type_size
+        path = self.tmp / "iq4nl_mps.gguf"
+        _write_gguf(
+            path,
+            [
+                ("w.weight", [256, 2], int(WeightType.IQ4_NL), bytes(2 * row_bytes)),
+                (
+                    "plain.weight",
+                    [256, 2],
+                    int(WeightType.IQ4_NL),
+                    bytes(2 * row_bytes),
+                ),
+            ],
+        )
+        server_args = Mock(
+            tp_size=1,
+            use_fsdp_inference=False,
+            lora_path=None,
+            minimax_h3_adaln_online=False,
+            minimax_h3_adaln_cache_path=None,
+            quantization=None,
+            nunchaku_config=None,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.loader.transformer_load_utils.current_platform"
+        ) as platform:
+            platform.is_cuda.return_value = False
+            platform.is_mps.return_value = True
+            platform.device_type = "mps"
+            with self.assertRaisesRegex(ValueError, "IQ4_NL.*mps"):
+                _resolve_gguf_quant_load_spec(
+                    gguf_file=str(path),
+                    server_args=server_args,
+                    model_cls=Mock(packed_modules_mapping=None),
+                )
+            # Tensors marked dequantize_on_load stay unpacked in BF16 and are allowed.
+            spec = _resolve_gguf_quant_load_spec(
+                gguf_file=str(path),
+                server_args=server_args,
+                model_cls=Mock(
+                    packed_modules_mapping=None,
+                    gguf_dequantize_prefixes=("w.", "plain."),
+                ),
+            )
+            self.assertEqual(spec.gguf_file, str(path))
 
     def test_rejects_fsdp_when_this_component_is_fsdp_managed(self):
         server_args_kwargs = {"use_fsdp_inference": True}
@@ -1027,6 +1136,121 @@ class TestQwenImage21GGUF(unittest.TestCase):
         attention = SimpleNamespace(to_q=projection, to_k=projection, to_v=projection)
 
         self.assertIsNone(QwenImage21Attention.packed_qkv_weight(attention))
+
+
+class TestWanVideoGGUF(unittest.TestCase):
+    """Community Wan2.1 GGUF checkpoints use official/ComfyUI tensor names."""
+
+    def test_official_wan_names_map_and_patch_embedding_stays_idempotent(self):
+        row_bytes = 512 // _Q4_K_BLOCK * _Q4_K_TYPE_SIZE
+        q_payload = bytes(4 * row_bytes)
+        vec_payload = np.zeros((4,), dtype=np.float32).tobytes()
+        f32_2d = np.zeros((2, 4), dtype=np.float32).tobytes()
+        server_args = Mock(
+            tp_size=1,
+            use_fsdp_inference=False,
+            lora_path=None,
+            minimax_h3_adaln_online=False,
+            minimax_h3_adaln_cache_path=None,
+            quantization=None,
+            nunchaku_config=None,
+        )
+        arch_config = WanVideoArchConfig()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.transformer_load_utils.current_platform"
+            ) as platform,
+        ):
+            path = str(Path(tmp) / "wan.gguf")
+            _write_gguf(
+                Path(path),
+                [
+                    ("patch_embedding.weight", [4], _F32, vec_payload),
+                    ("text_embedding.0.weight", [512, 4], _Q4_K, q_payload),
+                    ("blocks.0.self_attn.q.weight", [512, 4], _Q4_K, q_payload),
+                    ("blocks.0.cross_attn.k.weight", [512, 4], _Q4_K, q_payload),
+                    ("blocks.0.ffn.0.weight", [512, 4], _Q4_K, q_payload),
+                    ("blocks.0.modulation", [4, 2], _F32, f32_2d),
+                    ("head.head.weight", [512, 4], _Q4_K, q_payload),
+                    ("head.modulation", [4, 2], _F32, f32_2d),
+                ],
+            )
+            platform.is_cuda.return_value = False
+            platform.is_mps.return_value = True
+            platform.device_type = "mps"
+            spec = _resolve_gguf_quant_load_spec(
+                gguf_file=path,
+                server_args=server_args,
+                model_cls=WanTransformer3DModel,
+                arch_config=arch_config,
+            )
+
+        meta = spec.quant_config.tensor_meta
+        self.assertEqual(
+            meta["patch_embedding.weight"].param_name, "patch_embedding.proj.weight"
+        )
+        self.assertTrue(meta["text_embedding.0.weight"].dequantize_on_load)
+        self.assertEqual(
+            meta["text_embedding.0.weight"].param_name,
+            "condition_embedder.text_embedder.fc_in.weight",
+        )
+        self.assertEqual(
+            meta["blocks.0.self_attn.q.weight"].param_name,
+            "blocks.0.to_q.qweight",
+        )
+        self.assertEqual(
+            meta["blocks.0.cross_attn.k.weight"].param_name,
+            "blocks.0.attn2.to_k.qweight",
+        )
+        self.assertEqual(
+            meta["blocks.0.ffn.0.weight"].param_name,
+            "blocks.0.ffn.fc_in.qweight",
+        )
+        self.assertEqual(
+            meta["blocks.0.modulation"].param_name,
+            "blocks.0.scale_shift_table",
+        )
+        self.assertEqual(meta["head.head.weight"].param_name, "proj_out.qweight")
+        self.assertEqual(meta["head.modulation"].param_name, "scale_shift_table")
+
+        map_fn = get_param_names_mapping(
+            arch_config.param_names_mapping,
+            valid_target_names={"patch_embedding.proj.weight"},
+        )
+        self.assertEqual(
+            map_fn("patch_embedding.proj.weight"),
+            ("patch_embedding.proj.weight", None, None),
+        )
+
+    def test_post_load_weights_skips_gguf_qkv_fusion(self):
+        meta = GGUFTensorMeta(
+            ggml_type=int(_Q4_K),
+            logical_shape=(4, 512),
+            stored_shape=(4, 288),
+            stored_dtype=torch.uint8,
+            param_name="w.qweight",
+        )
+        config = GGUFConfig("/dev/null", {"w.weight": meta})
+        group = SimpleNamespace(world_size=1, rank_in_group=0)
+        block = WanTransformerBlock.__new__(WanTransformerBlock)
+        torch.nn.Module.__init__(block)
+        block.qkv_fusable = False
+        block.to_q = ColumnParallelLinear(
+            512, 4, bias=False, quant_config=config, prefix="w", tp_group=group
+        )
+        block.to_k = ColumnParallelLinear(
+            512, 4, bias=False, quant_config=config, prefix="w", tp_group=group
+        )
+        block.to_v = ColumnParallelLinear(
+            512, 4, bias=False, quant_config=config, prefix="w", tp_group=group
+        )
+
+        model = WanTransformer3DModel.__new__(WanTransformer3DModel)
+        torch.nn.Module.__init__(model)
+        model.blocks = torch.nn.ModuleList([block])
+        model.post_load_weights()
+        self.assertFalse(block.qkv_fusable)
 
 
 if __name__ == "__main__":

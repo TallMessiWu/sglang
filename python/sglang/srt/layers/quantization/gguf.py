@@ -28,6 +28,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.gguf_dequant_torch import (
+    ggml_dequantize_torch,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
@@ -197,13 +200,25 @@ def ggml_moe_get_block_size(qweight_type: int) -> int:
     )
 
 
+def _ggml_dequantize_dispatch(
+    qweight: torch.Tensor,
+    qweight_type: int,
+    m: int,
+    n: int,
+    dtype: torch.dtype | None,
+) -> torch.Tensor:
+    if (_is_cuda or _is_musa) and qweight.device.type in ("cuda", "musa"):
+        return ggml_dequantize(qweight, qweight_type, m, n, dtype)
+    return ggml_dequantize_torch(qweight, qweight_type, m, n, dtype)
+
+
 def dequantize_gguf_weight(
     qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
 ) -> torch.Tensor:
     """Dequantize a packed GGUF matrix using its inferred logical shape."""
     block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
     shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-    return ggml_dequantize(qweight, qweight_type, *shape, dtype)
+    return _ggml_dequantize_dispatch(qweight, qweight_type, *shape, dtype)
 
 
 def fused_mul_mat_gguf(
@@ -389,7 +404,7 @@ def apply_gguf_embedding(
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
-        dequant = ggml_dequantize(
+        dequant = _ggml_dequantize_dispatch(
             quant, qweight_type, hidden_size, x_flat.shape[0], dtype
         )
         return dequant.view(*x.shape, hidden_size)

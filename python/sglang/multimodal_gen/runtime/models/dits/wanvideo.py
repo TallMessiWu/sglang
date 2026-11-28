@@ -1379,6 +1379,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
+    gguf_dequantize_prefixes = ("condition_embedder.",)
 
     def __init__(
         self,
@@ -1541,6 +1542,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 block.fuse_qkv_weights()
         fused = sum(
             isinstance(block, WanTransformerBlock)
+            and block.qkv_fusable
             and block._fused_qkv(block.to_q.weight.device) is not None
             for block in self.blocks
         )

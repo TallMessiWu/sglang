@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import GGUFTensorMeta
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.gguf import (
     DEQUANT_TYPES,
@@ -30,6 +31,19 @@ from sglang.srt.layers.quantization.gguf import (
     apply_gguf_embedding,
     dequantize_gguf_weight,
 )
+from sglang.srt.layers.quantization.gguf_dequant_torch import TORCH_DEQUANT_TYPES
+
+
+def get_supported_gguf_dequant_types(
+    platform: Any = None,
+) -> set[gguf.GGMLQuantizationType] | frozenset[gguf.GGMLQuantizationType]:
+    """Return packed GGML types executable on the target diffusion platform."""
+    platform = current_platform if platform is None else platform
+    if platform.is_cuda():
+        return DEQUANT_TYPES
+    if platform.is_mps() or getattr(platform, "device_type", None) == "cpu":
+        return TORCH_DEQUANT_TYPES
+    return frozenset()
 
 
 class GGUFConfig(QuantizationConfig):
@@ -77,6 +91,30 @@ class GGUFConfig(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> GGUFConfig:
         raise ValueError("GGUFConfig must be constructed from a GGUF checkpoint")
 
+    def validate_supported_types(self, platform: Any = None) -> None:
+        """Fail fast when any packed tensor uses a GGML type unsupported here."""
+        platform = current_platform if platform is None else platform
+        supported = get_supported_gguf_dequant_types(platform)
+        supported_names = ", ".join(
+            sorted(weight_type.name for weight_type in supported)
+        )
+        for name, metadata in self.tensor_meta.items():
+            if not metadata.is_packed:
+                continue
+            try:
+                weight_type = metadata.weight_type
+            except ValueError as exc:
+                raise ValueError(
+                    f"GGUF tensor {name} uses unsupported GGML type code "
+                    f"{metadata.ggml_type} on {platform.device_type}"
+                ) from exc
+            if weight_type not in supported:
+                raise ValueError(
+                    f"GGUF tensor {name} uses unsupported type {weight_type.name} "
+                    f"on {platform.device_type} (supported packed types: "
+                    f"{supported_names or 'none'})"
+                )
+
     def get_quant_method(
         self, layer: nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
@@ -98,9 +136,11 @@ class GGUFConfig(QuantizationConfig):
             if unquantized_method is None:
                 return None
             return unquantized_method()
-        if weight_type not in DEQUANT_TYPES:
+        supported = get_supported_gguf_dequant_types()
+        if weight_type not in supported:
             raise ValueError(
-                f"GGUF tensor {prefix}.weight uses unsupported type {weight_type}"
+                f"GGUF tensor {prefix}.weight uses unsupported type "
+                f"{weight_type.name} on {current_platform.device_type}"
             )
         self.selected.add(prefix)
         if isinstance(layer, VocabParallelEmbedding):
@@ -184,4 +224,9 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         )
 
 
-__all__ = ["GGUFConfig", "GGUFEmbeddingMethod", "GGUFLinearMethod"]
+__all__ = [
+    "GGUFConfig",
+    "GGUFEmbeddingMethod",
+    "GGUFLinearMethod",
+    "get_supported_gguf_dequant_types",
+]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
+from collections import defaultdict
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -163,7 +164,11 @@ def remap_gguf_tensor_meta(
     """Map checkpoint tensor names while retaining raw lookup aliases."""
     remapped: dict[str, GGUFTensorMeta] = {}
     for checkpoint_name, metadata in tensor_meta.items():
-        if metadata.is_quantized and checkpoint_name.startswith(dequantize_prefixes):
+        parameter_name = name_mapper(checkpoint_name)
+        if metadata.is_quantized and (
+            checkpoint_name.startswith(dequantize_prefixes)
+            or parameter_name.startswith(dequantize_prefixes)
+        ):
             metadata = replace(
                 metadata,
                 stored_shape=metadata.logical_shape,
@@ -171,7 +176,6 @@ def remap_gguf_tensor_meta(
                 param_name=checkpoint_name,
                 dequantize_on_load=True,
             )
-        parameter_name = name_mapper(checkpoint_name)
         mapped_param_name = (
             f"{parameter_name.removesuffix('.weight')}.qweight"
             if metadata.is_packed
@@ -186,6 +190,88 @@ def remap_gguf_tensor_meta(
                 )
             remapped[alias] = mapped_metadata
     return remapped
+
+
+def gguf_runtime_layout(
+    tensor_meta: dict[str, GGUFTensorMeta],
+    mapping: dict[str, Any],
+    dequantize_prefixes: tuple[str, ...] = (),
+) -> tuple[dict[str, GGUFTensorMeta], dict[str, tuple[str, int, int]]]:
+    """Key GGUF metadata by runtime names; return it with the fused-shard plan.
+
+    Shards of one fused runtime layer (Z-Image w1/w3 -> w13) keep their own
+    entries and are concatenated on load, under the fused name quant lookup uses.
+    """
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+    map_name = get_param_names_mapping(mapping)
+    plain: dict[str, GGUFTensorMeta] = {}
+    fused: dict[str, dict[int, tuple[str, GGUFTensorMeta]]] = defaultdict(dict)
+    for name, meta in tensor_meta.items():
+        target, index, _ = map_name(name)
+        if index is None:
+            plain[name] = meta
+        else:
+            fused[target][index] = (name, meta)
+
+    layout = remap_gguf_tensor_meta(
+        plain,
+        lambda name: map_name(name)[0],
+        dequantize_prefixes=dequantize_prefixes,
+    )
+    shard_plan: dict[str, tuple[str, int, int]] = {}
+    for target, parts in fused.items():
+        metas = [parts[i][1] for i in sorted(parts)]
+        first = metas[0]
+        if len({(m.ggml_type, m.is_packed, m.logical_shape[1:]) for m in metas}) > 1:
+            raise ValueError(f"GGUF shards of {target} differ in type or width")
+        param_name = (
+            f"{target.removesuffix('.weight')}.qweight" if first.is_packed else target
+        )
+        layout[target] = replace(
+            first,
+            logical_shape=(
+                sum(m.logical_shape[0] for m in metas),
+                *first.logical_shape[1:],
+            ),
+            stored_shape=(
+                sum(m.stored_shape[0] for m in metas),
+                *first.stored_shape[1:],
+            ),
+            param_name=param_name,
+        )
+        for index, (name, meta) in parts.items():
+            layout[name] = meta
+            shard_plan[meta.param_name] = (param_name, index, len(parts))
+    return layout, shard_plan
+
+
+def runtime_gguf_weights(
+    weights: Generator[tuple[str, torch.Tensor], None, None],
+    layout: dict[str, GGUFTensorMeta],
+    shard_plan: dict[str, tuple[str, int, int]],
+    quant_config: Any,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Fuse planned shards and dequantize packed fallback tensors on load."""
+    gguf = _gguf_module()
+    packed_meta = {m.param_name: m for m in layout.values() if m.is_packed}
+    pending: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+    for name, tensor in weights:
+        if name in shard_plan:
+            name, index, total = shard_plan[name]
+            pending[name][index] = tensor
+            if len(pending[name]) < total:
+                continue
+            parts = pending.pop(name)
+            tensor = torch.cat([parts[i] for i in range(total)])
+        prefix = name.removesuffix(".qweight")
+        if name in packed_meta and prefix not in quant_config.selected:
+            meta = packed_meta[name]
+            value = gguf.dequantize(tensor.numpy(), meta.weight_type).reshape(
+                meta.logical_shape
+            )
+            name, tensor = f"{prefix}.weight", torch.from_numpy(value).bfloat16()
+        yield name, tensor
 
 
 def _tensor_to_torch(tensor, metadata: GGUFTensorMeta) -> torch.Tensor:
@@ -240,8 +326,10 @@ def names_gguf_checkpoint(reference: str) -> bool:
 
 __all__ = [
     "GGUFTensorMeta",
+    "gguf_runtime_layout",
     "gguf_weights_iterator",
     "names_gguf_checkpoint",
     "read_gguf_tensor_meta",
     "remap_gguf_tensor_meta",
+    "runtime_gguf_weights",
 ]
